@@ -1,0 +1,122 @@
+# ------------------------------------------------------------
+# Integração de múltiplas amostras 
+# Autor: Ramon BdS
+# ------------------------------------------------------------
+
+# 1. Pacotes
+library(Seurat)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(future)
+library(zellkonverter)
+# 2. Diretório base
+base_dir <- "/home/rsouza/workspace/Heart/DendriticCellActivationHCM"
+
+# Lista de subpastas (cada uma é uma amostra)
+sample_dirs <- list.dirs(base_dir, recursive = FALSE)
+sample_dirs
+
+# 3. Ler cada amostra e criar objetos Seurat
+sample_list <- list()
+
+for (dir in sample_dirs) {
+  sample_name <- basename(dir)
+  message("Lendo: ", sample_name)
+  
+  mtx <- list.files(dir, pattern = "matrix.mtx$", full.names = TRUE)
+  features <- list.files(dir, pattern = "features.tsv$", full.names = TRUE)
+  barcodes <- list.files(dir, pattern = "barcodes.tsv$", full.names = TRUE)
+  
+  data <- ReadMtx(mtx = mtx, features = features, cells = barcodes)
+  seurat_obj <- CreateSeuratObject(counts = data, project = sample_name)
+  sample_list[[sample_name]] <- seurat_obj
+}
+
+# 4. Ler metadados e adicionar a cada amostra
+metadata <- read_csv("metadadosGSE181764.csv")
+
+for (i in seq_along(sample_list)) {
+  sample_name <- names(sample_list)[i]
+  meta_row <- metadata %>% filter(GEOID == sample_name)
+  
+  (nrow(meta_row) == 1) {
+    sample_list[[i]]$tissue <- meta_row$tissue
+    sample_list[[i]]$gender <- meta_row$gender
+    sample_list[[i]]$age <- meta_row$age
+    sample_list[[i]]$disease_status <- meta_row$disease_status
+}}
+
+# 5. Pré-processamento básico por amostra
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+for (i in seq_along(sample_list)) {
+  cat("Processando:", names(sample_list)[i], "\n")
+  
+  obj <- sample_list[[i]]
+  DefaultAssay(obj) <- "RNA"
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+  
+  # Tenta rodar CellCycleScoring, mas ignora se falhar
+  tryCatch({
+    obj <- CellCycleScoring(
+      object = obj,
+      s.features = s.genes,
+      g2m.features = g2m.genes,
+      set.ident = FALSE
+    )
+  }, error = function(e) {
+    message("CellCycleScoring falhou em ", names(sample_list)[i], 
+            " — preenchendo S/G2M com zero.")
+    obj$S.Score <- 0
+    obj$G2M.Score <- 0
+  })
+  
+  obj <- NormalizeData(obj) %>%
+    FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+    ScaleData(vars.to.regress = c("percent.mt", "S.Score", "G2M.Score")) %>%
+    RunPCA(npcs = 20, verbose = FALSE)
+  
+  obj$batch <- names(sample_list)[i]
+  Idents(obj) <- "batch"
+  
+  sample_list[[i]] <- obj
+}
+
+# 6. Integração
+# ------------------------------------------------------------
+features <- SelectIntegrationFeatures(object.list = sample_list)
+anchors <- FindIntegrationAnchors(
+  object.list = sample_list,
+  anchor.features = features,
+  dims = 1:20
+)
+
+combined <- IntegrateData(anchorset = anchors, dims = 1:20)
+
+# 7. Redução de dimensionalidade e clustering
+# ------------------------------------------------------------
+DefaultAssay(combined) <- "integrated"
+
+combined <- ScaleData(combined, verbose = TRUE) %>%
+  RunPCA(npcs = 20, verbose = TRUE) %>%
+  RunUMAP(dims = 1:20) %>%
+  FindNeighbors(dims = 1:20) %>%
+  FindClusters(resolution = 0.4, algorithm = 4, verbose = TRUE)
+
+# 8. Verificação e visualização
+# ------------------------------------------------------------
+head(combined@meta.data)
+
+DimPlot(combined, reduction = "umap", group.by = "disease_status", label = TRUE) +
+  ggtitle("Células integradas por status da doença") +
+  NoLegend()
+
+DimPlot(combined, reduction = "umap", group.by = "batch") +
+  ggtitle("Verificação de integração entre amostras")
+
+# 9. Salvar do objeto final
+# ------------------------------------------------------------
+saveRDS(combined, file = "Heart_HCM_integrated.rds")
