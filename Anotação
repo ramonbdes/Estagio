@@ -1,6 +1,6 @@
-#####################
-### Anotação com scCATCH
-########################
+#-------------------------------
+### Carregando os pacotes
+################################
 library(Seurat)
 library(scCATCH)
 library(dplyr)
@@ -9,35 +9,13 @@ library(patchwork)
 library(dplyr)
 library(tidyr)
 library(clustifyR)
-scp.data <- ReadMtx(
-  mtx = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_raw_counts_V1.mtx",
-  features = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_genes_V1.tsv",
-  cells = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_barcodes_V1.tsv")
-scp <- CreateSeuratObject(counts = scp.data, project = "SCP2019_Analysis", 
-                          min.cells = 3, min.features = 200)
-scp <- NormalizeData(scp) 
-scp <- FindVariableFeatures(scp, selection.method = "vst", nfeatures = 2000)
-scp <- ScaleData(scp, features = rownames(scp))
-scp <- RunPCA(scp, features = VariableFeatures(scp))
-scp <- FindNeighbors(scp, dims = 1:50, k.param = 15)
-scp <- FindClusters(scp, resolution = 0.4, algorithm = 4)
-scp <- RunUMAP(scp, dims = 1:50,min.dist = 0.2)
 
-# METADADOS
-df <- read.csv("~/workspace/CarotidExpression/Carotid_MetaData_V1.csv")
-df <- df[-1, ] 
-colnames(df)[1] <- "cell_barcode" 
-rownames(df) <- df$cell_barcode 
-df$cell_barcode <- NULL
-common_cells <- intersect(colnames(scp), rownames(df))
-df <- df[common_cells, ]
-scp <- AddMetaData(object = scp, metadata = df)
-
-
+#-------------------------------
+### Visualizando os dados
 DimPlot(scp, reduction = "umap", label = TRUE, pt.size = 0.5)
 DimPlot(scp, reduction = "umap", label = TRUE, pt.size = 0.5, group.by = "celltype")
 
-##########################################
+#-------------------------------
 ### Anotação com scCATCH
 # Adicionar nomes ao vetor de clusters
 sc_cluster <- as.character(Idents(scp))
