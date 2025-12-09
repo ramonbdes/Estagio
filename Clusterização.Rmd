@@ -1,0 +1,100 @@
+---
+title: "Clusterização"
+author: "Ramon Bertoldi"
+date: "2025-10-13"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r warning=FALSE, message=FALSE}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+scp.data <- ReadMtx(
+  mtx = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_raw_counts_V1.mtx",
+  features = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_genes_V1.tsv",
+  cells = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_barcodes_V1.tsv")
+scp <- CreateSeuratObject(counts = scp.data, project = "SCP2019_Analysis", 
+                          min.cells = 3, min.features = 200)
+scp <- NormalizeData(scp) 
+scp <- FindVariableFeatures(scp, selection.method = "vst", nfeatures = 2000)
+scp <- ScaleData(scp, features = rownames(scp))
+scp <- RunPCA(scp, features = VariableFeatures(scp))
+scp <- FindNeighbors(scp, dims = 1:50, k.param = 15)
+```
+
+### Algoritmo de Louvain
+
+O algoritmo tenta otimizar a modularidade global do gráfico rapidamente, movendo nós (células) para o cluster que fornece o maior ganho local na modularidade. 
+
+```{r warning=FALSE}
+scp <- FindClusters(
+  scp, 
+  resolution = 0.4, 
+  algorithm = 1, 
+  random.seed = 42,
+  group.singletons = FALSE)
+scp <- RunUMAP(scp, dims = 1:50, verbose = FALSE)
+plot1 <- UMAPPlot(scp)
+plot1
+
+```
+
+### Algoritmo de Louvain com refinamento multinível
+
+Aplica o Louvain em várias etapas (níveis), tratando os clusters do nível anterior como nós no nível atual.
+
+```{r warning=FALSE}
+scp <- FindClusters(
+  scp, 
+  resolution = 0.4, 
+  algorithm = 2, 
+  random.seed = 42,
+  group.singletons = FALSE
+)
+scp <- RunUMAP(scp, dims = 1:50, verbose = FALSE)
+plot2 <- UMAPPlot(scp)
+plot2
+
+```
+
+### Algoritmo SLM
+
+Similar ao Louvain, mas usa um método de otimização local diferente e mais eficiente em memória para otimizar a modularidade.
+
+```{r warning=FALSE}
+scp <- FindClusters(
+  scp, 
+  resolution = 0.4, 
+  algorithm = 3, 
+  random.seed = 42,
+  group.singletons = FALSE
+)
+scp <- RunUMAP(scp, dims = 1:50, verbose = FALSE)
+plot3 <- UMAPPlot(scp)
+plot3
+```
+
+### Algoritmo de Leiden
+
+Otimiza a modularidade como o Louvain, mas com uma etapa de refinamento que garante que os clusters sejam internamente conectados. É o mais reocmendado para clusterização atualmente.
+
+```{r warning=FALSE}
+scp <- FindClusters(
+  scp, 
+  resolution = 0.4, 
+  algorithm = 4, 
+  random.seed = 42,
+  group.singletons = FALSE
+)
+scp <- RunUMAP(scp, dims = 1:50, verbose = FALSE)
+plot4 <- UMAPPlot(scp)
+plot4
+```
+
+Até agora, o único algoritmo que performou de forma diferente, reduzindo o número de clusters de 12 para 10. Ao que parece, o algoritmo de Leiden juntous os clusters 5 e 10;  3 e 7 dos outros algoritmos, que agruparam os núcleos igualmente. 

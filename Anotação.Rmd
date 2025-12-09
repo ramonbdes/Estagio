@@ -1,0 +1,267 @@
+---
+title: "Anotação Celular"
+author: "Ramon Bertoldi"
+date: "2025-10-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Anotando com três ferramentas diferentes:
+
+Realizaremos a anotação de tipos celulares no dataset usando três ferramentas distintas:
+
+1.  [scCATCH](https://github.com/ZJUFanLab/scCATCH);
+
+2.  [clustifyr](https://github.com/rnabioco/clustifyr);
+
+3.  [SingleR](https://www.bioconductor.org/packages/release/bioc/html/SingleR.html){.uri}
+
+A escolha de quais ferramentas usar depende de sua plataforma de análise (R ou python), tipo de dados (se é tumoral ou não),, tipo de pacote (Seurat, scanpy, Bioconductor...) e tipo de tecido. Escolhemos essas trẽs por se adequarem melhor à nossa situação.
+
+Primeiro instalaremos todos os pacotes necessários, carregaremos o dataset, que contém dados de $6049$ células de artéria humana ([SCP2019](https://singlecell.broadinstitute.org/single_cell/study/SCP2019/vascular-smooth-muscle-cell-phenotype-switching-in-carotid-atherosclerosis#study-summary)), e faremos o *workflow* básico do Seurat até a geração do UMAP. Também carregaremos os metadados do estudo, com os quais poderemos ver como ficou a anotação orignal dos autores. Infelizmente, eles não informam como fizeram a anotação, mas tentaremos reproduzí-la da maneira mais fiel mesmo assim.
+
+```{r warning=FALSE, message=FALSE}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(tidyr)
+library(scCATCH)
+library(scCATCH)
+library(clustifyr)
+library(SingleR)
+library(celldex)
+
+scp.data <- ReadMtx(
+  mtx = "~/Documents/Estágio/SCP2019/Carotid_Expression/Carotid_Expression_Matrix_raw_counts_V1.mtx",
+  features = "~/Documents/Estágio/SCP2019/Carotid_Expression/Carotid_Expression_Matrix_genes_V1.tsv",
+  cells = "~/Documents/Estágio/SCP2019/Carotid_Expression/Carotid_Expression_Matrix_barcodes_V1.tsv")
+scp <- CreateSeuratObject(counts = scp.data, project = "SCP2019_Analysis", 
+                          min.cells = 3, min.features = 200)
+scp <- NormalizeData(scp) 
+scp <- FindVariableFeatures(scp, selection.method = "vst", nfeatures = 2000)
+scp <- ScaleData(scp, features = rownames(scp))
+scp <- RunPCA(scp, features = VariableFeatures(scp))
+scp <- FindNeighbors(scp, dims = 1:50, k.param = 15)
+scp <- FindClusters(scp, resolution = 0.4, algorithm = 4, random.seed = 42)
+scp <- RunUMAP(scp, dims = 1:50,min.dist = 0.2)
+
+# METADADOS
+df <- read.csv("~/Documents/Estágio/SCP2019/Carotid_Expression/Carotid_MetaData_V1.csv")
+df <- df[-1, ] 
+colnames(df)[1] <- "cell_barcode" 
+rownames(df) <- df$cell_barcode 
+df$cell_barcode <- NULL
+common_cells <- intersect(colnames(scp), rownames(df))
+df <- df[common_cells, ]
+scp <- AddMetaData(object = scp, metadata = df)
+
+
+DimPlot(scp, reduction = "umap", label = TRUE, pt.size = 0.5)
+DimPlot(scp, reduction = "umap", label = TRUE, pt.size = 0.5, group.by = "celltype")
+
+```
+
+## scCATCH
+
+O *single cell Cluster-based Annotation Toolkit for Cellular Heterogeneity (*scCATCH) é uma ferramenta de anotação automática baseada no uso de marcadores gênicos.
+
+![Fonte: <https://github.com/ZJUFanLab/scCATCH>](https://github.com/ZJUFanLab/scCATCH_performance_comparison/raw/master/Overview.png)
+
+Ele funciona fazendo uma correspondẽncia entre marcadores genéticos dos clusters do dataset e marcadores genéticos conhecidos de células cadastrados no CellMatch, uma bases de dados de referência de taxonomia celular tecíduo-específica[^1].
+
+[^1]: O CellMatch inclui 353 tipos celulares e 686 subtipos associados com 184 tipos teciduais.
+
+```{r warning = FALSE}
+### Anotação com scCATCH
+########################
+# Adicionar nomes ao vetor de clusters
+sc_cluster <- as.character(Idents(scp))
+names(sc_cluster) <- Cells(scp)
+sc_data <- GetAssayData(scp, slot = "data")
+# Anotação
+obj <- createscCATCH(data = sc_data, cluster = sc_cluster)
+obj <- findmarkergene(obj, 
+                      species = "Human",
+                      tissue = c("Artery"),  
+                      marker = cellmatch)
+obj <- findcelltype(obj)
+# Adicionar anotações
+annotations <- obj@celltype
+scp$scCATCH_annotation <- annotations$cell_type[match(as.character(Idents(scp)), annotations$cluster)]
+# Resultado final
+print(table(scp$scCATCH_annotation))
+#Visualização
+DimPlot(scp, reduction = "umap", group.by = "scCATCH_annotation", label = TRUE, label.size = 3, repel = TRUE) +
+  ggtitle("Anotação - scCATCH") +  theme(legend.position = "right")
+
+```
+
+Como podemos ver, a anotação não ficou fiel à dos autores. Provavelmente, o scCATCH não tem muitos marcadores para nosso tecíduo. Vamos a outra ferramenta.
+
+## clustifyr
+
+O clustifyr classifica células e clusters com base em diferentes tipos de dados. bulk RNA-seq, microarray, single-cell, ou listas de marcadores escolhidas previamente. Depois, o clustifyr faz uso de correlações para definir os tipos. Dessa vez, faremos a anotação com uma lista de marcadores para vaso sanguíneo do [CellMarker 2.0](http://www.bio-bigdata.center/)
+
+```{r warning = FALSE}
+### Anotação com clustifyR
+########################
+
+# 1. Processar a nova tabela
+cellmarker_data <- read.csv("~/Documents/Estágio/SCP2019/BloodVesselCellMarkers.csv")  
+# 2. Limpar e padronizar os dados
+vascular_ref_bloodvessel <- cellmarker_data %>%
+  filter(Species == "Human", `Tissue.Class` == "Blood vessel",
+         `Cancer` == "Normal cell") %>%
+  select("Cell.name", "Cell.marker") 
+#%>%
+#  rename(cell_type = Cell.name, gene = Cell.marker) 
+# %>%
+#   mutate(
+#     # Limpar e padronizar nomes de genes
+#     gene = toupper(gsub("a-SMA|a-smooth muscle actin", "ACTA2", gene)),
+#     gene = gsub("BCL-6", "BCL6", gene),
+#     gene = gsub("C-Kit", "KIT", gene),
+#     gene = gsub("CD102", "ICAM2", gene),  # CD102 é ICAM2
+#     gene = gsub("CD105", "ENG", gene),    # CD105 é Endoglin
+#     gene = gsub("CD133", "PROM1", gene),  # CD133 é Prominin-1
+#     gene = gsub("CD15", "FUT4", gene),    # CD15 é FUT4
+#     gene = gsub("CD157", "BST1", gene),   # CD157 é BST1
+#     gene = gsub("CD16", "FCGR3A", gene),  # CD16 é FCGR3A
+#     gene = gsub("Adgre1", "ADGRE1", gene),
+#     gene = gsub("Apj", "APLNR", gene),
+#     gene = gsub("Bpgm", "BPGM", gene),
+#     gene = gsub("C1qb", "C1QB", gene),
+#     gene = gsub("Ccl2", "CCL2", gene),
+#     gene = gsub("Ccl3", "CCL3", gene),
+#     gene = gsub("Ccr7", "CCR7", gene),
+#     gene = toupper(gene)  # garantir tudo maiúsculo
+#   ) %>%
+#   distinct()
+
+# 3. Padronizar tipos celulares
+vascular_ref_clean <- vascular_ref_bloodvessel 
+# %>%
+#   mutate(
+#     cell_type_standardized = case_when(
+#       grepl("Smooth muscle|Myofibroblast", cell_type, ignore.case = TRUE) ~ "Smooth_Muscle",
+#       grepl("Endothelial|Microvascular", cell_type, ignore.case = TRUE) ~ "Endothelial",
+#       grepl("Macrophage|Microglial|Foam cell", cell_type, ignore.case = TRUE) ~ "Macrophage",
+#       grepl("Fibroblast", cell_type, ignore.case = TRUE) ~ "Fibroblast",
+#       grepl("T cell|Th cell", cell_type, ignore.case = TRUE) ~ "T_cell",
+#       grepl("B cell", cell_type, ignore.case = TRUE) ~ "B_cell",
+#       grepl("Natural killer", cell_type, ignore.case = TRUE) ~ "NK_cell",
+#       grepl("Monocyte", cell_type, ignore.case = TRUE) ~ "Monocyte",
+#       grepl("Dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+#       grepl("Stem|Progenitor", cell_type, ignore.case = TRUE) ~ "Progenitor",
+#       grepl("Astrocyte", cell_type, ignore.case = TRUE) ~ "Astrocyte",
+#       grepl("Red blood", cell_type, ignore.case = TRUE) ~ "Erythrocyte",
+#       TRUE ~ cell_type
+#     )
+#   ) %>%
+#   filter(!is.na(gene), gene != "") %>%
+#   distinct()
+
+# 4. Ver tipos celulares disponíveis no pacote
+table(vascular_ref_clean$Cell.name)
+
+# 5. Criar matriz de referência
+all_genes <- unique(vascular_ref_clean$Cell.marker)
+all_celltypes <- unique(vascular_ref_clean$Cell.name)
+
+bloodvessel_ref <- matrix(0, nrow = length(all_genes), ncol = length(all_celltypes))
+rownames(bloodvessel_ref) <- all_genes
+colnames(bloodvessel_ref) <- all_celltypes
+
+for(i in 1:nrow(vascular_ref_clean)) {
+  gene <- vascular_ref_clean$Cell.marker[i]
+  celltype <- vascular_ref_clean$Cell.name[i]
+  if(gene %in% rownames(bloodvessel_ref) && celltype %in% colnames(bloodvessel_ref)) {
+    bloodvessel_ref[gene, celltype] <- 1
+  }
+}
+
+
+# Fazer a anotação
+scp <- clustify(
+  input = scp,
+  cluster_col = "seurat_clusters",
+  ref_mat = bloodvessel_ref,
+  seurat_out = TRUE
+)
+
+# A. UMAP com novas anotações
+DimPlot(scp, reduction = "umap", group.by = "type", 
+              label = TRUE, label.size = 3, repel = TRUE) + ggtitle("Anotações - Vasos Sanguíneos") +
+  theme(legend.position = "right")
+# C. Visualizar marcadores específicos
+FeaturePlot(scp, features = c("ACTA2", "ENG", "CD68", "CD3D"), ncol = 2, max.cutoff = 3)
+# D. Violin plots
+VlnPlot(scp, features = c("ACTA2", "PECAM1", "CD68", "CD3D"), group.by = "type", pt.size = 0.1)
+
+```
+
+Fornecendo os marcadores, nossa anotação já ficou bem mais parecida com a dos autores. Vamos para a próxima ferramenta.
+
+## SingleR
+
+```{r warning=FALSE}
+#Anotação com SingleR
+##########################
+# --- 2. Preparar Clusters para Anotação ---
+# Converte seurat_clusters para factor com níveis ordenados (crucial para AggregateExpression)
+scp$seurat_clusters <- factor(scp$seurat_clusters, levels = unique(as.character(scp$seurat_clusters)))
+
+# Preparar Dados de Referência SingleR ---
+hpca.se <- HumanPrimaryCellAtlasData() # Human Primary Cell Atlas Data
+
+# Calcular Expressão Média por Cluster (Pseudo-bulk) ---
+# Usa AggregateExpression para gerar a matriz de Genes x Clusters
+cluster_means <- AggregateExpression(
+  object = scp,
+  group.by = "seurat_clusters",
+  assays = "RNA",
+  slot = "data")$RNA
+
+# Harmonizar Nomes de Coluna (Crucial) ---
+# Garante que os nomes das colunas de cluster_means correspondem aos IDs reais de scp$seurat_clusters
+if (length(colnames(cluster_means)) == length(levels(scp$seurat_clusters))) {
+  colnames(cluster_means) <- levels(scp$seurat_clusters)
+} else {
+  stop("Erro: Mismatch no número de colunas do cluster_means e níveis de clusters Seurat.")
+}
+
+# Executar Anotação SingleR ---
+singleR_predictions_clusters <- SingleR(
+  test = cluster_means,
+  ref = hpca.se,
+  labels = hpca.se$label.main # ou hpca.se$label.fine para mais granularidade
+)
+
+# Mapear Anotações para o Objeto Seurat ---
+# Extrai os rótulos e IDs harmonizados
+singleR_labels <- singleR_predictions_clusters$pruned.labels
+cluster_IDs_harmonized <- colnames(cluster_means)
+
+# Cria o mapa nomeado de cluster ID -> label
+annotations_map <- singleR_labels
+names(annotations_map) <- cluster_IDs_harmonized
+
+# Cria o vetor de anotação para cada célula e nomeia com os barcodes das células
+cell_annotations_vector <- annotations_map[as.character(scp$seurat_clusters)]
+names(cell_annotations_vector) <- colnames(scp) 
+
+# Adiciona a nova coluna de anotação ao objeto Seurat
+scp <- AddMetaData(
+  object = scp,
+  metadata = cell_annotations_vector,
+  col.name = "singleR_annotations"
+)
+
+# Visualização
+DimPlot(scp, group.by = "singleR_annotations", label = TRUE, repel = TRUE) + NoLegend() + ggtitle("SingleR Annotations")
+
+```

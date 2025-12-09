@@ -1,0 +1,95 @@
+---
+title: "Ciclo Celular"
+author: "Ramon Bertoldi"
+date: "2025-10-13"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Pontuação de ciclo celular e regressão 
+
+```{r warning=FALSE, message=FALSE}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+scp.data <- ReadMtx(
+  mtx = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_raw_counts_V1.mtx",
+  features = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_genes_V1.tsv",
+  cells = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_barcodes_V1.tsv")
+scp <- CreateSeuratObject(counts = scp.data, project = "SCP2019_Analysis", 
+                          min.cells = 3, min.features = 200)
+scp <- NormalizeData(scp) 
+scp <- FindVariableFeatures(scp, selection.method = "vst", nfeatures = 2000)
+scp <- ScaleData(scp, features = rownames(scp))
+scp <- RunPCA(scp, features = VariableFeatures(scp))
+scp <- FindNeighbors(scp, dims = 1:50, k.param = 15)
+```
+
+
+## Atribuindo pontuação do ciclo celular
+
+O Seurat tem uma lista de marcadores do ciclo celular (Tyrosh et al , 2015) carregada dentro de si. Vamos usá-la para atribuir a pontuação do ciclo celular nas células. 
+
+```{r warning=FALSE}
+# Segregando a lista em marcaodres da fase G2/M e marcadores da fase S.
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+#Fazendo a pontuação:
+scp <- CellCycleScoring(scp, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+# Visualizar pontuações do ciclo celular e atribuições de fase
+head(scp[[]])
+```
+
+## Visualização
+```{r warning=FALSE}
+# Distribuição dos marcadores do cilco celular
+RidgePlot(scp, features = c("CCL3"), ncol = 2)
+```
+
+## PCA
+
+Rodar uma PCA com genes do ciclo celular revela que as células separam-se inteiramente por fase do cilo celular. 
+
+```{r warning=FALSE}
+scp <- RunPCA(scp, features = c(s.genes, g2m.genes))
+DimPlot(scp)
+```
+
+## Regressão pelo ciclo celular durante dimensionamento dos dados
+
+Iremos remover a heterogeneidade dos dados que vem da expressão diferencial de genes do ciclo celular.
+```{r warning=FALSE}
+scp <- ScaleData(scp, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(scp))
+scp <- RunPCA(scp, features = c(s.genes, g2m.genes))
+DimPlot(scp)
+```
+
+## Caminho alternativo
+
+Em caso do objeto de estudos se tratar de células em processo de diferenciação, como a hematopoiése, remover toda a variação explicada pelos genes do ciclo celular pode atrapalhar a análise posterior. Por causa disso, podemos optar por regredir a diferença entre a pontuação da fase G2M e da fase S, mantendo a diferença de expressão entre células estacionárias no ciclo celular e células que estão se diferenciando.
+
+```{r warning=FALSE}
+scp$CC.Difference <- scp$S.Score - scp$G2M.Score
+scp <- ScaleData(scp, vars.to.regress = "CC.Difference", features = rownames(scp))
+```
+
+```{r warning=FALSE}
+# cell cycle effects strongly mitigated in PCA
+scp <- RunPCA(scp, features = VariableFeatures(scp), nfeatures.print = 10)
+```
+
+```{r warning=FALSE}
+# when running a PCA on cell cycle genes, actively proliferating cells remain distinct from G1
+# cells however, within actively proliferating cells, G2M and S phase cells group together
+spc <- RunPCA(scp, features = c(s.genes, g2m.genes))
+DimPlot(scp)
+```
+
+
+

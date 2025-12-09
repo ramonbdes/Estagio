@@ -1,0 +1,1006 @@
+---
+title: "Workflow básico de snRNA-seq em um pequeno dataset"
+author: "Ramon Bertoldi"
+date: "2025-10-14"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introdução
+
+Discussão sobre linhas de código, suas funções e seus argumentos num pipeline de análise de dados de single-cell RNAseq. O guia para esse texto é o [Tutorial do Seurat elaborado pelo Satija Lab](https://satijalab.org/seurat/articles/pbmc3k_tutorial.html).
+
+Primeiro carregamos os pacotes necessários. [Dplyr](https://dplyr.tidyverse.org/) para manipulação dos dados, [Patchwork](https://patchwork.data-imaginist.com/) para juntar figuras, e [Seurat](#id_0), que é a principal ferramenta de análise de *single-cell* (sc) ou s*ingle-nuclei* (sn) RNA-seq na linguagem R.
+
+```{r warning=FALSE, message=FALSE}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+```
+
+Depois, vamos carregar os dados. Usaremos dados de sn-RNAseq de artéria humana ([SCP2019](https://singlecell.broadinstitute.org/single_cell/study/SCP2019/vascular-smooth-muscle-cell-phenotype-switching-in-carotid-atherosclerosis#study-summary)), e leremos com a função do pacote Seurat `ReadMtx`.
+
+1.  O argumento `data.dir` da função pede um diretório que contenha três arquivos: (1) matrix.mtx; (2) genes.tsv (ou features.tsv); e (3) barcodes.tsv.
+
+2.  O argumento `gene.collumn` especifica qual coluna do arquivo (2) será usada para obtermos os nomes dos genes (o padrão é a coluna 2).
+
+3.  O argumento `cell.collumn` especifica qual coluna do arquivo (3) será usada para obtermos o nome das células (o padrão é a coluna 1)
+
+4.  O argumento `unique.features` garante que os genes ou as features sejam únicas, e que não precisemos lidar com genes duplicados.
+
+5.  `strip.suffix` se for `TRUE` remove o sufixo padrão (como o `"-1"`) que é adicionado ao final dos barcodes de célula em alguns pipelines de processamento.
+
+```{r warning=FALSE}
+#Carregamento dos dados e criação do Objeto Seurat
+scp.data <- ReadMtx(
+  mtx = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_raw_counts_V1.mtx",
+  features = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_genes_V1.tsv",
+  cells = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_barcodes_V1.tsv")
+```
+
+Observando a expressão de alguns genes nos dados brutos.
+```{r warning=FALSE}
+scp.data[c("CD3D", "TCL1A", "MS4A1"), 1:30]
+```
+
+Os `.` entre os números são respresentação do valor de expressão do gene naquela célula. Como há muitos genes com 0 valor de expressão em muitas células, o Seurat armazena os dados num matriz-esparsa (oposto de uma matriz densa) para economizar armazenamento e exigiri menos poder computacional para manipular os dados.
+
+Aqui podemos comparar o tamanho da matriz densa e da matriz esparsa para os dados de contagens brutas.
+
+```{r warning=FALSE}
+dense.size <- object.size(as.matrix(scp.data))
+dense.size
+```
+
+Agora transformaremos `scp.data` num objeto Seurat. `CreateSeuratObject` admite 8 argumentos. Aqui são necessários incluir apenas 4.
+
+1.  `counts`: indica de onde virão os dados brutos de contagem, ou um objeto tipo matriz (genes x células) ou um objeto tipo Assay. Geralmente é o resultado de leitura de `Read10x`.
+2.  `assay`: define o nome do Assay (tipo de dados de contagem) para os dados de entrada. Para snRNA-seq ou scRNA-seq, o padrão é `"RNA"`.
+3.  `names.field`: Especifica qual "campo" (parte) do nome do barcode da célula deve ser usado para preencher a coluna `orig.ident` nos metadados do objeto Seurat.
+4.  `names.delim`: Especifica o caractere (ou string) que delimita os campos no nome do barcode da célula. A função usará este delimitador para dividir o nome da célula em partes.
+5.  `meta.data`: inclusão de um `data.frame` onde as linhas são nomes celulares e as colunas são campos adicionais de metadados. As linhas desse `data.frame` precisam ser compatíveis com as colunas da matriz de contagens brutas.
+6.  `project`: nome do projeto para o objeto Seurat
+7.  `min.cells`: número mínimo de células onde um gene/feature deve ser encontrado para ser incluído no objeto Seurat.
+8.  `min.features`: número mínimo de genes/features que uma célula deve possuir para ser incluída no objeto Seurat.
+
+```{r warning=FALSE}
+#Initialize the Seurat object with the raw (non-normalized data).
+scp <- CreateSeuratObject(counts = scp.data, project = "SCP2019K", min.cells = 3, min.features = 200)
+scp
+```
+
+## Metadados
+
+Antes do controle de qualidade, vamos rapidamente adicionar os metadados do dataset.
+
+```{r warning=FALSE, message=FALSE}
+
+library(data.table)
+df <- read.csv("~/workspace/CarotidExpression/Carotid_MetaData_V1.csv")
+df <- df[-1, ] #remove a primeira linha
+colnames(df)[1] <- "cell_barcode" #muda o nome da primeira coluna
+rownames(df) <- df$cell_barcode #transforma os valores da coluna cell_barcode em rownames
+df$cell_barcode <- NULL # Remove a coluna depois de usá-la como rownames
+# Alinhamento de células (Garantir que os barcodes sejam os mesmos)
+common_cells <- intersect(colnames(scp), rownames(df))
+# Filtra o dataframe para ter apenas as células que sobreviveram ao QC do Seurat
+df <- df[common_cells, ]
+# Adicionar todas as colunas do novo metadado ao objeto Seurat
+scp <- AddMetaData(object = scp, metadata = df)
+# Verificação
+print("Metadados adicionados com sucesso. Novas colunas de metadados:")
+print(colnames(scp@meta.data))
+```
+
+# Pré-processamento padrão
+
+Aqui cobriremos controle de qualidade (QC), normalização dos dados, dimensionamento dos dados, e seleção de atributos
+
+## Controle de Qualidade
+
+Ao criar um objeto Seurat, a própria função já realiza o QC, com métricas pré-definidas, mas que podem ser modificadas pelo usuário.
+
+1.  Filtragem de células com contagens de genes acima de $2500$ ou menos de $200$.
+2.  FIltragem de células com $> 5\%$ de genes mitrocondriais.
+
+Essas métricas são baseadas em alguns pressupostos
+
+1.  Células de baixa qualidade ou droplets vazios (droplets são gotas microfluídicas que encapsulam células únicas na preparção de amostras de scRNA-seq) frequentemente apresentam poucos genes expressos.
+2.  Doublets (droplets com $>1$ célula). podem exibir uma contagem aberrante de genes expressos.
+3.  Células com um alto nível de genes mitocondriais expressos podem ser células células de baixa-qualidade ou células em processo de morte celular.
+
+Por isso, células que apresentam muitos ou poucos genes expresssos, e além de muitos genes mitcondriais expressos, são eliminadas no QC.
+
+As métricas de genes únicos expressos e número, número total de moléculas detectadas, e $%$ de genes mitocondriais ficam armazendas em `scp@metada`.
+
+Aqui vamos adicionar uma coluna aos metadados com o operador `[[]]`.
+
+```{r warning=FALSE}
+scp[["percent.mt"]] <- PercentageFeatureSet(scp, pattern = "^MT-")
+```
+
+```{r warning=FALSE}
+# Show QC metrics for the first 5 cells
+head(scp@meta.data, 5)
+```
+
+Também podemos visualizar as métricas de QC em gráficos.
+
+``` {r warning=FALSE}
+# Violin plot
+VlnPlot(scp, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+```{r warning=FALSE, message=FALSE}
+# Usando FeatureScatter( ) 
+plot1 <- FeatureScatter(scp, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(scp, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+
+Também é possível reaplicar métricas de QC para filtrar células.
+
+``` {r warning=FALSE, message=FALSE}
+scp <- subset(scp, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+```
+
+## Normalizando os dados
+
+`NormalizaData( )`
+
+A normalização dos dados é essencial para a análise porque nos baseamos
+no pressuposto de que células diferentes tem quantidades diferentes de
+mRNA.
+
+A fim de podermos comparar células diferentes, devemos aplicar um
+algortimo de normalização das contagens. Os três mais usados são:
+
+1.  O método do logartimo de deslocamento, que aplica a função
+   $f(x) = log (\frac{y}{s}+y_o)$ nos dados.
+2.  O método SCRAN, que usa uma deconvolução para estimar os fatores de
+    tamanho com base em uma regressão linear sobre genes para conjuntos
+    (pools) de células.
+3.  Os resíduos analíticos de Pearson, que usa um modelo linear
+    generalizado misto comprofudindade de sequenciamento como covariável
+    para obter a matriz transformada.
+
+Os principais argumentos são
+
+1.  `object`: objeto Seurat
+2.  `normalization.method`: Seurat admite 3.
+    1.  `"LogNormalize":` divide as contagens de genes de cada célula
+        pelo número total de contagens daquela célula. O resultado é
+        multiplicado pelo `scale.factor` e depois transformado pelo
+        logaritmo natural usando `log1p`.
+    2.  `"CLR"`: aplica uma transformação logarítimica às contagens e
+        depois as centraliza subtraindo a média geométrica de todas as
+        contagens de genes na célula.
+    3.  `"RC"`: divide as contagens de genes de cada célula pelo número
+        total de contagens daquela célula, multiplica pelo
+        `scale.factor`, mas não aplica uma transformação logarítmica.
+3.  `scale.factor`: define o fator de escala para a normalização.
+4.  `margin`: caso usar o método CLR, defina se normaliza entre
+    contagens ou células.
+5.  `block.size`: define quantas células serão rodadas em cada pedaço da
+    transformção.
+6.  `verbose`: exibição de barra de progresso.
+7.  `assay`: nome do assay usado.
+
+``` {r warning=FALSE, message=FALSE}
+scp <- NormalizeData(scp, normalization.method = "LogNormalize", 
+                      scale.factor = 10000)
+```
+Os argumentos dos valores acima já estão embutidos como padrão na
+função, então poderíamos simplesmente realizar
+``` {r warning=FALSE, message=FALSE}
+scp <- NormalizeData(scp)
+```
+Os resultados são armazenados em `scp[["RNA"]]$data`.
+
+Outra maneira mais robusta de normalizar os dados é através da função
+`SCTransform`. Além de realizar a normalização, a função também
+substitui `FindVariableFeatures` e `ScaleData`.
+
+## Identificação de atributos altamente variáveis (*feature selection*)
+
+`FindVariableFeatures( )`
+
+Agora vamos calcular um subset dos dados que contenha os genes ou
+atributos que exibem alta variação entre as células.
+
+1.  `object`: objeto Seurat
+2.  `selection.method`: como a função escolherá os atributos mais
+    variáveis
+    1.  `"vst"`: encaixa uma linha num relação log(variância) e
+        log(mean) usando regressão polinomial local (LOESS). Padroniza
+        os valores dos atribudos usando a média observada e a variância
+        esperada (que é dada pela linha encaixada nos dados). A
+        variância dos atributos é então calculada nos valores
+        padronizados depois de um corte para um valor máximo.
+    2.  `"mean.var.plot"`(mvp): usa uma função para calcular a expressão
+        média e a dispersão para cada aributo. Depois divide os
+        atributos em `num.bin` (padrão $= 20$) baseadas na sua
+        expressão média e calcula z-scores para a dispersão dentro de
+        cada bin. O objetivo é identificar os atributos mais variáveis
+        enquanto se controla a forte relação entre variabilidade e
+        expressão média.
+    3.  `"dispersion"`: seleciona os genes com maiores valores de
+        dispersão
+3.  `loess.span`: (método vst)
+4.  `clip.max`: (método vst)
+5.  `mean.function`: função para computar o valor do eixo-x (expressão
+    média). O padrão é pegar a média dos valores detectados não-nulos.
+6.  `dispersion.function`: função para computar o valor do eixo-y
+    (dispersão). O padrão é usar o desvio-padrão de todos os valores.
+7.  `num.bin`: usado apenas com o método `"mean.var.plot"`. Número total
+    de bins a serem usados na análise (o padrão é 20).
+8.  `binning.method`: especifica como bins devem ser calculadas.
+    1.  `"equal_width"`: cada bin tem a mesma largura ao longo do eixo-x
+        (padrão).
+    2.  `"equal_frequency"`: cada bin contém um número igual de
+        atributos (isso pode aumentar o poder estatístico para detectar
+        atributos muito dispersos em valores de alta expressão, mas a
+        custo de perda de resolução ao longo do eixo-x.
+9.  `verbose`: exibição de barra de progresso.
+10. `nfeatures`: número de atributos mais variáveis a serem buscados. Só
+    pode ser usado quando `"vst"` ou `"dispersion"` são selecionados.
+11. `mean.cuttoff`: vetor numérico com comprimento $=2$ com um valor de corte maior
+    e um valor menor.
+12. `dispersion.cutoff`:
+13. `assay`: nome do assay usado.
+
+``` {r}
+scp <- FindVariableFeatures(scp, selection.method = "vst", nfeatures = 2000)
+```
+
+``` {r warning=FALSE, message=FALSE}
+
+#Identificando os top 10 genes + variáveis
+top10 <- head(VariableFeatures(scp), 10)
+
+#plotando com e sem identificadores
+plot1 <- VariableFeaturePlot(scp)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1
+plot2
+```
+
+## Dimensionando os dados
+
+`ScaleData( )`
+
+Etapa necessária para realizar técnicas de redução de dimensionalidade
+depois. Muda a expressão de cada gene variável, para que a expressão
+média entre a células seja 0, e dimensiona a expressão de cada gene
+varíavel, para a variância entre as células seja 1. A ideia por trás
+disso é impedir que genes altamente expressos não dominem as análises
+posteriores. Os resultados ficam armazenados em
+`scp[["RNA"]]$scale.data`.
+
+1.  `object`: objeto Seurat
+2.  `features`: vetor com o nome dos genes a serem
+    dimensionados/centralizdos. O padrão são genes variáveis.
+3.  `vars.to.regress`: variáveis para regredir, como `nUMI` ou
+    `percent.mito`.
+4.  `split.by`: número de variáveis extraídas dos metadados, vetor ou
+    fator que será usado para agrupar as células.
+5.  `model.use`: uso de um modelo linear ou GLM (poisson, binomial
+    negativa) para a regressão. As opções são `"linear"` (padrão),
+    `"poisson"`, e `"negbinom"`.
+6.  `use.umi:` regredir em dados de contagens UMI. O padrão é `FALSE` se
+    `"linear"` é escolhido em `model.use`, mas torna-se `TRUE` se
+    `"poisson"` e `"negbinom"` são escolhidos.
+7.  `do.scale`: onde dimensionar os dados.
+8.  `do.center`: onde centralizar os dados.
+9.  `scale.max`: valor máximo a ser retornado para dados dimensionados.
+    Padrão é `10`.
+10. `block.size`: número padrão de genes para dimensionar num único
+    cálculo.
+11. `min.cells.to.block`: se o objeto contiver menos que este número,
+    não bloquear para dimensionar.
+12. `verbose`: exibição de barra de progresso.
+13. `assay`: nome do *assay* usado.
+
+``` {r warning=FALSE, message=FALSE}
+all.genes <- rownames(scp)
+scp <- ScaleData(scp, features = all.genes)
+```
+
+A função `ScaleData( )` também pode ser usada para eliminar fontes de
+variação indesejadas, como posição no ciclo celular, contaminação por
+genes mitocondriais, etc.
+
+``` {r warning=FALSE, message=FALSE}
+scp <- ScaleData(scp, vars.to.regress = "percent.mt")
+```
+
+## Redução de dimensionalidade
+
+`RunPCA( )`
+
+O padrão é usarmos os atributos mais variáveis que já foram calculados
+antes, mas isso pode ser mudado no argumento `feature`. Entretanto,
+devemos no certificar que todos os dados que passarão pela reduão de
+dimensionalidade foram dimensioandos.
+
+Para os primeiros componentes principais, Seurat dá como saída os genes
+com os maiores pesos positivos e negativos, representando módulos de
+genes que exibem tanto correlação ou anti-correlação entre células
+únicas no dataset.
+
+1.  `object`: objeto Seurat
+2.  `assay`: nome do assay a ser utilizado
+3.  `npcs`: número total de componentes principais a serem calculados e
+    armazenados (o padrão é $50$).
+4.  `rev.pca`: a função calcula a PCA numa matrix de células x genes. Se
+    esse agumento for `TRUE`, PCA será calculada numa matrix genes x
+    células
+5.  `weight.by.var`: pondera as incorporações das células pela variância
+    de cada PC (pondera os pesos de genes se `rev.pca` for `TRUE`)
+6.  `verbose`: printa os genes que mais estão associados a altos ou
+    baixos carregamentos para os PCs.
+7.  `ndims.print`: número de PCs para printar os genes.
+8.  `nfeatures.print`: número de genes para printar para cada PCA.
+9.  `reduction.key`: especifica a string antes do número para o nome das
+    dimensões. PC é o padrão.
+10. `seed.use`: define uma seed aleatória. O padrão é $42$. Mudar para NULL não irá
+    definir uma seed.
+11. `approx`: usa decomposição de valor singular truncada para aproximar
+    a PCA.
+12. `features`: atributos usados para calcular a PCA. Se `features` for
+    `NULL`, a PCA será executada usando os atributos variáveis para o
+    *Assay*. Note que as features devem estar presentes nos dados
+    escalonados. Quaisquer atributos solicitados que não estejam
+    escalonadas ou que tenham variância zero serão descartados, e a PCA
+    será executada usando os atZributos restantes.
+13. `reduction.name`: nome da redução de dimensionalidade. O padrão é
+    `"pca"`.
+
+``` {r warning=FALSE}
+scp <- RunPCA(scp, features = VariableFeatures(object = scp))
+```
+
+Visualizando...
+
+``` {r warning=FALSE}
+print(scp[["pca"]], dims = 1:5, nfeatures = 5)
+```
+
+``` {r warning=FALSE}
+VizDimLoadings(scp, dims = 1:2, reduction = "pca")
+```
+
+## Determinando a dimensionalidade do dataset
+
+Seurat clusteriza as células com base em seus escores na PCA.
+Entretanto, fica a cargo do usuário escolher quantos PCs usar. O plot
+abaixo é uma boa maneira de visualizar quais PCs contribuem mais com a
+variação observada nos dados.
+
+``` {r warning=FALSE}
+ElbowPlot(scp)
+```
+
+Aqui vemos que a variação se concentra nos primeiros 10 PCs.
+
+## Clusterizando as células
+
+`FindNeighbors( )` e `FindClusters( )`
+
+Seurat clusteriza as células usando uma abordagem baseada em gráficos. A
+função `FindNeighbors( )` constrói um gráfico KN baseado na distância
+euclideana no espaço da PCA., tomando como input padrão os últimos 10
+PCs.
+
+1.  `object`: objeto Seurat.
+2.  `query`: matriz de dados a serem consultados em relação ao objeto.
+    Se ausente, o padrão é o `object`.
+3.  `distance.matrix`: se a matriz fornecida é uma matriz de distância.
+4.  `k.param`: define K para o algoritmo KNN.
+5.  `return.neighbor`: retorna o resultado como um obejto `Neighbor`.
+6.  `compute.SNN`: calcula o gráfico compartilhado de vizinhos próximos
+    (SNN).
+7.  `prune.SNN`: define o valor de corte para o índice de Jaccard
+    aceitável quando calcula a sobreposição de vizinhos para a
+    construção do SNN. Bordas e valores $\leq0$ serão removidos. do SNN.
+    `0` = sem podas; `1` = podar tudo.
+8.  `nn.method`: ,método para achar vizinhos próximos, `rann` ou
+    `annoy`.
+9.  `n.trees`: se usar `annoy` no argumento anterior, usar mais árvores
+    aqui aumenta a precisão.
+10. `annoy.metric`: métrica de distância para `annoy` --- `euclidean`,
+    `cosine`, `manhattan`, `hamming`.
+11. `nn.eps`: erro associado ao executar a busca de vizinhos mais
+    próximos usando RANN; o padrão de `0.0` implica pesquisa exata do
+    vizinho mais próximo
+12. `verbose`: printar ou não o resultado no console.
+13. `l2.norm`: realizar L2norm nos dados.
+14. `cache.index`: incluir índice em cache no objeto Neighbor retornado
+    (somente relevante se return.neighbor = TRUE)
+15. `index`: índice pré-calculado. Útil ao consultar novos dados em um
+    índice existente para evitar recomputação.
+16. `features`: atributos usados para construir o (S)NN, usado apenas se
+    `dims = NULL`.
+17. `reduction`: redução usada como input para construir (S)NN.
+18. `dims`: dimensãos da redução usadas como input.
+19. `assay`: *assay* usado para fazer (S)NN, usado apenas quando
+    `dims = NULL`.
+20. `do.plot`: plotar gráfico SNN em coordenadas tSNE.
+21. `graph.name`: parâmetro de nomenclatura opcional para o gráfico de
+    (S)NN armazenado (ou objeto Neighbor, se `return.neighbor = TRUE`).
+    O padrão é `assay.name_(s)nn`. Para armazenar o gráfico de vizinho e
+    o gráfico vizinho mais próximo compartilhado (SNN), devemos fornecer
+    um vetor contendo dois nomes para o parâmetro `graph.name`. O
+    primeiro elemento do vetor será usado para armazenar o grafo vizinho
+    mais próximo (NN) e o segundo elemento para armazenar o gráfico SNN.
+    Se apenas um nome for fornecido, apenas o gráfico NN será
+    armazenado.
+
+O próximo passo é a clusterizaçãode fato das células. Em especial,
+devemos definir o algoritmo e a resolução da função.
+
+1.  `object`: objeto Seurat
+2.  `modularity.fxn` função de modularidade; `1` = padrão; `2` =
+    alternativo.
+3.  `resolution`: valor do parâmetro de resolução. Valores 
+    $<1$ para obter um número menor $>1$ para obter um número maior
+    de comunidades.
+4.  `algorithm`: algoritmo para otimização de modularidade. `1` =
+    Louvain; `2` = Louvain com refinamento multinível; `3` = SLM; `4` =
+    Leiden.
+5.  `n.start`: número de começos aleatórios.
+6.  `n.iter`: máximo número de iterações apra começo aleatório.
+7.  `random.seed`: *seed.*
+8.  `group.singletons`: agrupar *singletons*, no cluster mais próximo.
+    Se `FALSE`, vai agrupar todos os *singletons* em grupo "singleton".
+9.  `temp.file.location`: diretório onde os arquivos intermediários
+    serão colocados.
+10. `edge.file.name`: arquivo *edge* para usar como input para
+    otimizador de modularidade *jar*.
+11. `verbose`: printar output.
+12. `graph.name`: nome do gráfico par ser usado no algoritmo de
+    clusterização.
+13. `cluster.name`: nome do clusters gerados.
+
+``` {r warning=FALSE, message=FALSE}
+scp <- FindNeighbors(scp, dims = 1:50, k.param = 15 )
+```
+
+``` {r warning=FALSE, message=FALSE}
+scp <- FindClusters(scp, resolution = 0.4, algorithm = 4)
+```
+
+## Realizar redução de dimensionalidade não-linear (UMAP/tSNE)
+
+`RunUMAP( )`
+
+1.  `object`: objeto Seurat
+2.  `reduction.key`: key de redução de dimensionalidade, especifica a
+    string antes do número das dimensões. É "UMAP" por padrão.
+3.  `assay`: *assay* de onde puxar dados quando usamos `features`, ou
+    assay usado para construir gráficos se rodarmos UMAP num gráfico.
+4.  `reduction.model`: objeto DimReduc que contém o modelo UMAP.
+5.  `return.model`: se o UMAP vai retornar o modelo uwot.
+6.  `umap.method`: qual implementação do rodar:
+    1.  `uwot`: roda via o pacote uwot.
+    2.  `uwot-learn`: roda via o pacote uwot e retorna o modelo de umap
+        learned.
+    3.  `umap-learn`: roda a versão wrapped do pacote python para
+        umap-learn
+7.  `n.neighbors`: determina o número de pontos vizinhos usados em
+    aproximações locais da estrutura *manifold.* Valores maiores
+    resultarão na preservação de uma estrutura global, com perda da
+    estrutura local . Em geral, esse parâmetro deve estar na faixa de
+    $5$ a $50$.
+8.  `n.components`: a dimensão do espaço para integrar o UMAP.
+9.  `metric`: determina a escolha da métrica usada para medir a
+    distância no espaço do input.
+10. `n.epochs`: o número de *epochs* de treinamento a serem usadas na
+    otimização da incorporação de baixa dimensão. Valores maiores
+    resultam em incorporações mais precisas. Se `NULL` for especificado,
+    um valor será selecionado com base no tamanho do conjunto de dados
+    de entrada $200$ para conjuntos de dados
+    grandes, $500$ para pequenos).
+11. `learning.rate`: taxa inicial de aprendizado para o otimização
+    incorporada.
+12. `min.dist`: controla o quão firmemente a incorporação permite
+    comprimir os pontos. Valores maiores garantem que os pontos
+    incorporados sejam distribuídos de forma mais uniforme, enquanto
+    valores menores permitem que o algoritmo otimize com mais precisão
+    em relação à estrutura local. Valores razoáveis estão na faixa de
+    $0.001$ a $0.5$.
+13. `spread`: escala efetiva dos pontos incorporados. Em combinação com
+    `min.dist`, determina o quão agrupados/agrupados os pontos
+    incorporados estão.
+14. `set.op.mix.ratio`: interpolar entre união (*fuzzy*) e interseção
+    como a operação de conjunto usada para combinar conjuntos
+    simpliciais *fuzzy* locais para obter conjuntos simpliciais *fuzzy*
+    globais. Ambas as operações de conjunto *fuzzy* usam a norma t do
+    produto. O valor deste parâmetro deve estar entre $0.0$ e $1.0$ usará uma união *fuzzy*
+    pura, enquanto $0.0$ usará uma interseção
+    *fuzzy* pura.
+15. `local.connectivity`: a conectividade local necessária --- ou seja,
+    o número de vizinhos mais próximos que devem ser considerados
+    conectados em nível local. Quanto maior esse valor, mais conectada o
+    *manifold* se torna localmente. Na prática, isso não deve ser maior
+    do que a dimensão intrínseca local da *manifold*.
+16. `repulsion.strength`: ponderação aplicada a amostras negativas na
+    otimização de incorporação de baixa dimensão. Valores maiores que um
+    resultarão em maior peso atribuído às amostras negativas.
+17. `negative.sample.rate`: o número de amostras negativas a serem
+    selecionadas por amostra positiva no processo de otimização.
+    Aumentar esse valor resultará em maior força repulsiva aplicada,
+    maior custo de otimização, mas um pouco mais de precisão.
+18. `a`: parâmetros mais específicos que controlam a incorporação. Se
+    `NULL`, esses valores são definidos automaticamente, conforme
+    determinado pela distância mínima e dispersão. Parâmetro de
+    aproximação diferenciável do functor adjunto direito.
+19. `b`: parâmetros mais específicos que controlam a incorporação. Se
+    `NULL`, esses valores são definidos automaticamente, conforme
+    determinado pela distância mínima e dispersão. Parâmetro de
+    aproximação diferenciável do functor adjunto direito.
+20. `seed.use`: define uma *seed* aleatória
+21. `metric.kwds`: dicionário de argumentos a serem passados para a
+    métrica, com`f`o o valor p da distância de Minkowski. Se `NULL`,
+    nenhum argumento será passado.
+22. `angular.rp.forest`: se deve ou não usar uma floresta de projeção
+    aleatória angular para inicializar a busca aproximada do vizinho
+    mais próximo. Isso pode ser mais rápido, mas é mais útil para
+    métricas que usam uma distância de estilo angular, como cosseno,
+    correlação, etc. No caso dessas métricas, as florestas angulares
+    serão escolhidas automaticamente.
+23. `densmap`: se deve ou não usar o objetivo de densidade aumentada do
+    densMAP. Ativar esta opção gera uma incorporação onde as densidades
+    locais são encorajadas a serem correlacionadas com aquelas no espaço
+    original. Os parâmetros abaixo com o prefixo `"dens"` controlam ainda
+    mais o comportamento desta extensão. O padrão é `FALSE`. Compatível
+    apenas com o método *"umap-learn"* e a versão do umap-learn $\geq0.5.0$.
+24. `dens.lambda`: Parâmetro específico que controla o peso de
+    regularização do termo de correlação de densidade no densMAP.
+    Valores mais altos priorizam a preservação da densidade em relação
+    ao objetivo UMAP, e vice-versa para valores mais próximos de zero.
+    Definir este parâmetro como zero equivale a executar o algoritmo
+    UMAP original. O valor padrão é $2$.
+25. `dens.frac`:P arâmetro específico que controla a fração de *epochs*
+    (entre $0$ e $1$) em que o objetivo de
+    densidade aumentada é usado no densMAP. A primeira fração (1 -
+    dens_frac) de épocas otimiza o objetivo UMAP original antes da
+    introdução do termo de correlação de densidade. O padrão é $0.3$.
+26. `dens.var.shift`: Parâmetro específico que define uma pequena
+    constante adicionada à variância dos raios locais na incorporação ao
+    calcular o objetivo de correlação de densidade para evitar que a
+    instabilidade numérica seja dividida por um número pequeno. O padrão
+    é $0.1$.
+27. `verbose`: controla verbosidade
+28. `densmap.kwds`: um dicionário de argumentos para passar para a
+    otimização do densMAP.
+29. `dims`: quais dimensões usar como input; usado apenas se
+    `features = NULL`.
+30. `reduction`: qual redução de dimensionalidade usar para o UMAP;
+    `PCA` (padrão) ou `ICA`.
+31. `features`: roda o UMAP num subset de atributos, em vez de rodar num
+    set de dimensões reduzidas. Por padrão é `NULL` e `dims = NULL` se
+    for rodar `features`.
+32. `graph`: nome do gráfico onde rodar o UMAP.
+33. `nn.name`: númro do output knn onde rodar o UMAP.
+34. `slot`: slot usado para puxar dados quando usar `features`.
+35. `reduction.name`: nome para armazenar a redução de dimensionalidade
+    no objeto Seurat.
+
+``` {r warning=FALSE, message=FALSE}
+scp <- RunUMAP(scp, dims = 1:50, min.dist = 0.2)
+```
+
+``` {r warning=FALSE, message=FALSE}
+DimPlot(scp, reduction = "umap")
+```
+
+E assim podemos salvar o umap:
+
+``` {r warning=FALSE}
+#saveRDS(scp, file = "../output/scp_tutorial.rds")
+```
+
+## Encontrando genes diferencialmente expressos
+
+`FindMarkers ( )`
+
+1.  `object`: objeto Seurat
+
+2.  `slot`: slot para extrair dados; observe que se `test.use` for
+    `"negbinom"`, `"poisson"` ou `"DESeq2"`, o slot será definido como
+    `"counts".`
+
+3.  `cells.1`: vetor com o nome das células pertencendo ao grupo 1.
+
+4.  `cells.2`: vetor com o nome das células pertencendo ao grupo 2.
+
+5.  `features`: genes selecionados para testar. O normal é usar todos.
+
+6.  `logfc.threshold`: Limite o teste a genes que apresentem, em média,
+    uma diferença de pelo menos X vezes (escala logarítmica) entre os
+    dois grupos de células. O padrão é $0.1$. Aumentar o
+    `logfc.threshold` acelera a função, mas pode ignorar sinais mais
+    fracos. Se o parâmetro do slot for `"scale.data"`, nenhuma filtragem
+    será realizada.
+
+7.  `test.use`: qual teste usar entre:
+
+    1.  `"wilcox"`: identifica genes diferencialmente expressos entre
+        dois grupos de células usando um teste Wilcoxon Rank Sum
+        (padrão); usará uma implementação rápida do Presto se instalado.
+
+    2.  `"wilcox_limma"`: identifica genes diferencialmente expressos
+        entre dois grupos de células usando a implementação *limma* do
+        teste Wilcoxon Rank Sum; defina esta opção para reproduzir os
+        resultados do Seurat v4.
+
+    3.  `"bimod"`: teste de razão de verossimilhança para expressão
+        gênica de célula única, (McDavid et al., Bioinformatics, 2013).
+
+    4.  `"roc"`: identifica 'marcadores' de expressão gênica usando
+        análise ROC. Para cada gene, avalia (usando AUC) um
+        classificador construído apenas naquele gene, para classificar
+        entre dois grupos de células. Um valor de AUC de
+        $1$ significa que os valores de expressão para este gene sozinho podem classificar
+        perfeitamente os dois agrupamentos (ou seja, cada uma das
+        células em `cells.1` exibe um nível mais alto do que cada uma
+        das células em `cells.2`). Um valor de AUC de $0.5$ implica que o gene não
+        tem poder preditivo para classificar os dois grupos. Retorna uma
+        matriz classificada com 'poder preditivo' (abs(AUC-0,5) \* 2) de
+        genes potencialmente expressos diferencialmente.
+
+    5.  `"t"`: Identifica genes diferencialmente expressos entre dois
+        grupos de células usando o teste t de Student.
+
+    6.  `"negbinom"`: identifica genes diferencialmente expressos entre
+        dois grupos de células usando um modelo linear generalizado
+        binomial negativo. Usar apenas para conjuntos de dados baseados
+        em UMI.
+
+    7.  `"poisson"`: identifica genes diferencialmente expressos entre
+        dois grupos de células usando um modelo linear generalizado de
+        poisson. Usar apenas para conjuntos de dados baseados em UMI.
+
+    8.  `"LR"`: utiliza uma estrutura de regressão logística para
+        determinar genes diferencialmente expressos. Constrói um modelo
+        de regressão logística que prevê a associação ao grupo com base
+        em cada característica individualmente e o compara a um modelo
+        nulo com um teste de razão de verossimilhança.
+
+    9.  `"MAST"`: identifica genes diferencialmente expressos entre dois
+        grupos de células usando um modelo de barreira adaptado aos
+        dados de scRNA-seq. Utiliza o pacote MAST para executar o teste
+        DE.
+
+    10. `"DESEeq2"`: identifica genes diferencialmente expressos entre
+        dois grupos de células com base em um modelo que utiliza o
+        DESeq2, que utiliza uma distribuição binomial negativa (Love et
+        al., Genome Biology, 2014). Este teste não permite a
+        pré-filtragem de genes com base na diferença média (ou taxa de
+        detecção percentual) entre grupos de células. No entanto, os
+        genes podem ser pré-filtrados com base em sua taxa de detecção
+        mínima (`min.pct`) em ambos os grupos de células. Para usar este
+        método, instale o DESeq2 seguindo as instruções em
+        <https://bioconductor.org/packages/release/bioc/html/DESeq2.html>.
+
+8.  `min.pct`: only test genes that are detected in a minimum fraction
+    of min.pct cells in either of the two populations. Meant to speed up
+    the function by not testing genes that are very infrequently
+    expressed. Default is 0.01
+
+9.  `min.diff.pct`: testar apenas genes detectados em uma fração mínima
+    de células `min.pct` em qualquer uma das duas populações. Visa
+    acelerar a função, não testando genes que são expressos com pouca
+    frequência. O padrão é $0.01$.
+
+10. `verbose`: exibi uma barra de progresso. O padrão é -Inf.
+
+11. `only.pos`: retorna apenas marcadores positivos. O padrão é `FALSE`.
+
+12. `max.cells.per.ident`: Reduza a amostragem de cada classe de
+    identidade para um número máximo. O padrão é sem redução de
+    amostragem. Não ativado por padrão (definido como Inf)
+
+13. `random.seed`: define uma *seed* aleatória.
+
+14. `latent.vars`: variáveis a serem testadas, usadas somente quando
+    `test.use` é um dos seguintes: '`LR'`, `'negbinom'`, `'poisson'` ou
+    `'MAST'`.
+
+15. `min.cells.feature`: número mínimo de células que expressam a
+    característica em pelo menos um dos dois grupos, atualmente usado
+    apenas para testes de Poisson e binomial negativo
+
+16. `min.cells.group`: número mínimo de células em um dos grupos.
+
+17. `fc.results`: `data.frame` de FoldChange.
+
+18. `densify`: Converta a matriz esparsa para uma forma densa antes de
+    executar o teste DE. Isso pode aumentar a velocidade, mas pode
+    exigir mais memória; o padrão é `FALSE`.
+
+19. `fc.slot`: slot usado para calcular *fold-change* - também afetará o
+    padrão para `mean.fxn`, veja abaixo para mais detalhes.
+
+20. `pseudocount.use`: pseudocontagem para adicionar aos valores de
+    expressão médios ao calcular $log_{FC}$. $1$ por padrão.
+
+21. `norm.method`: método de normalização para cálculo de *fold change*
+    quando o slot é `“data”`.
+
+22. `mean.fxn`: função a ser usada para cálculo de *fold change* ou
+    diferença média. O padrão depende do valor de `fc.slot`:
+
+    1.  `"counts"`: diferença no logaritmo das contagens médias, com
+        pseudocontagem.
+
+    2.  `"data"`: diferença no logaritmo dos dados exponenciados médios,
+        com pseudocontagem. Isso ajusta as diferenças na profundidade do
+        sequenciamento entre as células e pressupõe que os "dados" foram
+        normalizados em logaritmo.
+
+    3.  `"scale.data"`: diferença nas médias dos dados dimensionados.
+
+23. `fc.name`: Nome do `fold change`, diferença média ou função
+    personalizada no data.frame de saída. Se for `NULL`, a coluna de
+    `fold change` será nomeada de acordo com a base do logaritmo (por
+    exemplo, `"avg_log2FC"`) ou, se estiver usando o `slot scale.data`,
+    `"avg_diff"`.
+
+24. `base`: a base em relação à qual os logaritmos são calculados.
+
+25. `recorrect_umi`: recalcular contagens de UMI corrigidas usando o
+    mínimo dos UMIs medianos ao executar DE usando vários objetos SCT; o
+    padrão é `TRUE`.
+
+26. `ident.1`: classe de identidade para definir marcadores; passar um
+    objeto da classe `phylo` ou `'clustertree'` para encontrar
+    marcadores para um nó em uma árvore de cluster; passar
+    `'clustertree'` requer que `BuildClusterTree` tenha sido executado.
+
+27. `ident.2`: segunda classe de identidade para comparação; se `NULL`,
+    use todas as outras células para comparação; se um objeto da classe
+    `phylo` ou `'clustertree'` for passado para ident.1, deve passar um
+    nó para encontrar marcadores para
+
+28. `group.by`: reagrupa células em uma classe de identidade diferente
+    antes de executar a expressão diferencial (veja o exemplo);
+    `"ident"` para usar Idents
+
+29. `subset.ident`: subconjunto de uma classe de identidade específica
+    antes do reagrupamento. Relevante somente se `group.by` estiver
+    definido (veja o exemplo).
+
+30. `assay`: ensaio a ser usado no teste de expressão diferencial.
+
+31. `reduction`: redução para uso em testes de expressão diferencial -
+    testará DE em incorporações de células
+
+``` {r warning=FALSE}
+# find all markers of cluster 2
+#cluster2.markers <- FindMarkers(scp, ident.1 = 2)
+#head(cluster2.markers, n = 5)
+```
+
+``` {r warning=FALSE}
+# find all markers distinguishing cluster 5 from clusters 0 and 3
+#cluster5.markers <- FindMarkers(scp, ident.1 = 5, ident.2 = c(0, 3))
+#head(cluster5.markers, n = 5)
+```
+
+Agora para todos os marcadores:
+
+``` {r warning=FALSE}
+scp.markers <- FindAllMarkers(scp, only.pos = TRUE,
+                                logfc.threshold = 0.25, 
+                                test.use = "wilcox")
+```
+
+
+``` {r warning=FALSE}
+# scp.markers %>%
+#     group_by(cluster) %>%
+#     dplyr::filter(avg_log2FC > 1)
+```
+
+### Plotando células com genes diferencialmente expressas
+
+`VlnPlot( )` e `FeaturePlot( )` e `DoHeatmap`
+
+``` {r warning=FALSE}
+#VlnPlot(scp, features = c("MS4A1", "CD79A"))
+```
+
+1.  `object`: objeto Seurat
+2.  `features`: atributosa serem plotados (expressão genética, matriz,
+    pontuações de PC, qualquer coisa que possa ser recuperada pelo
+    FetchData)
+3.  `cols`: cores a serem usadas na plotagem.
+4.  `pt.size`: tamano dos pontos.
+5.  `alpha`: valor de alfa para os pontos (padrão é $1$).
+6.  `idents`: qual classes incluir na plotagem (padrão é todas).
+7.  `sort`: classificar classes de identidade (no eixo x) pela expressão
+    média do atributo que está sendo plotado, também pode passar
+    'increasing' ou 'decreasing' para alterar a direção da
+    classificação.
+8.  `assay`: nome do ensaio a ser usado.
+9.  `group.by`: agrupar (colorir) células de diferentes maneiras (por
+    exemplo, `orig.ident`)
+10. `split.by`: um fator nos metadados do objeto para dividir o gráfico,
+    passar `'ident'` para dividir pela identidade da célula.
+11. `adjust`: ajustar o parâmetro para `geom_violin.`
+12. `y.max`: valor máximo do eixo-y.
+13. `same.y.lims`: define todos os limites do eixo-y para o mesmo valor.
+14. `log`: plota o eixo dos atributos numa escala logarítimica.
+15. `ncol`: número de colunas se há múltiplos plots.
+16. `slot`: slot onde colocar os dados de expressão (e.g. `"counts"` ou
+    `"data"`).
+17. `layer`: camada para extrair dados de expressão (por exemplo,
+    `"contagens"` ou `"dados"`)
+18. `split.plot`: plote cada grupo de gráficos de violino divididos por
+    formas de violino múltiplas ou únicas.
+19. `stack`: empilhar gráficos horizontalmente para cada atributo.
+20. `combine`: combina plots em um único objeto *ggplot patchworked*. Se
+    "FALSE", retorna uma lista de *ggplots*.
+21. `fill.by`: colore violinos/cristas com base em `'feature'` ou
+    `'ident'`
+22. `flip`: muda a orientação do plot (identidades no eixo-x)
+23. `add.noise`: determina se adiciona ou não ruído para plotar.
+24. `raster`: converte pontos para o formato *raster*. Requer a
+    instalação do `'ggrastr'`.
+25. `raster.dpi`: o dpi para camada *raster*, o padrão é $300$.
+
+``` {r warning=FALSE}
+# FeaturePlot(scp, features = c("MS4A1", "GNLY", "CD3E", "CD14", "FCER1A", "FCGR3A", "LYZ", "PPBP",
+#     "CD8A"))
+```
+
+
+1.  `object`: objeto Seurat.
+2.  `features`: atributosa serem plotados (expressão genética, matriz,
+    pontuações de PC, qualquer coisa que possa ser recuperada pelo
+    FetchData).
+3.  `dims`: dimensões a serem plotadas, devem ser um vetor numérico de
+    dois comprimentos especificando as dimensões x e y
+4.  `cells`: vector of cells to plot (default is all cells)
+5.  `cols`: cores a serem usadas na plotagem.
+6.  `pt.size`: tamano dos pontos.
+7.  `alpha`: valor de alfa para os pontos.
+8.  `order`: argumnto booleano que determina se as células devem ser
+    plotadas em ordem de expressão. Pode ser útil se células que
+    expressam determinada característica estiverem sendo ocultadas.
+9.  `min.cutoff` e `max.cuttoff`: vetor de valores de corte mínimo e
+    máximo para cada característica, pode especificar quantil na forma
+    de `'q##'` onde `'##'` é o quantil (por exemplo, `'q1'`, `'q10'`).
+10. `reduction`: qual redução de dimensionalidade usar. Se não for
+    especificado, primeiro busca por umap, depois por tsne e, por fim,
+    por pca.
+11. `split.by`: um fator nos metadados do objeto para dividir o gráfico,
+    passar `'ident'` para dividir pela identidade da célula.
+12. `keep.scale`: como lidar com a escala de cores em vários gráficos.
+    As opções são:
+    1.  `"feature"` (padrão; por linhas/atributos dimensionandos): os
+        gráficos para cada recurso individual são dimensionados para a
+        expressão máxima do recurso nas condições fornecidas para
+        `split.by`
+    2.  `"all"` (escala universal): os gráficos para todos os atributos
+        e condições são dimensionados para o valor máximo de expressão
+        para o recurso com a maior expressão geral.
+    3.  `NULL` (sem escala): cada gráfico individual é dimensionado para
+        o valor máximo de expressão do recurso na condição fornecida
+        para split.by. Esteja ciente de que definir NULL resultará em
+        escalas de cores incomparáveis entre os gráficos.
+13. `shape.by`: se `NULL`, todos os pontos são círculos (padrão). Você
+    pode especificar qualquer atributo de célula (que pode ser obtido
+    com FetchData), permitindo cores e formatos diferentes nas células.
+    Aplicável somente se raster = FALSE.
+14. `slot`: de qual slot extrair dados de expressão.
+15. `blend`: dimensiona e combina valores de expressão para visualizar a
+    coexpressão de dois atributos.
+16. `blend.threshold`: o corte de cor do sinal fraco ao sinal forte;
+    varia de $0$ a $1$.
+17. `label`: legendar ou não os clusters.
+18. `label.size`: defineo o tamanho das legendas.
+19. `label.color`: define a cor do texto de legenda.
+20. `repel`: repele legendas.
+21. `ncol`: número de colunas se há múltiplos plots.
+22. `coord.fixed`: plotar coordenadas cartesianas com proporção de
+    aspecto fixa.
+23. `by.col`: se dividir por um fator, plote as divisões por coluna com
+    os atributos como linhas; ignorado se `blend = TRUE`
+24. `interactive`: faz um `FeaturePlot` interativo.
+25. `combine`: combina plots em um único objeto *ggplot patchworked*. Se
+    "FALSE", retorna uma lista de *ggplots*.
+26. `add.noise`: determina se adiciona ou não ruído para plotar.
+27. `raster`: Converte pontos para o formato *raster*, o padrão é
+    `NULL`, que rasteriza automaticamente se plotar mais de
+    $100000$ células.
+28. `raster.dpi`: resolução de pixels para gráficos rasterizados,
+    passada para `geom_scattermore()`. O padrão é `c(512, 512)`.
+
+``` {r warning=FALSE}
+# scp.markers %>%
+#     group_by(cluster) %>%
+#     dplyr::filter(avg_log2FC > 1) %>%
+#     slice_head(n = 10) %>%
+#     ungroup() -> top10
+# DoHeatmap(pbmc, features = top10  ) + NoLegend()
+```
+
+1.  `object`: objeto Seurat.
+
+2.  `features`: vetor de atributos para plotar
+
+3.  `cells`: vetor de células para ploar.
+
+4.  `group.by`: vetor de variáveis paara agrupar células, passar `ìdent`
+
+5.  `group.bar`: adiciona uma barra de cores mostrando o status de grupo
+    de células.
+
+6.  `group.colors`: cores para usar na barra de cores.
+
+7.  `disp.min`: exibe valor mínimo (todos os valores abaixo serão
+    cortados)
+
+8.  `disp.max`: exie valor máximo (todos os valores acima serão
+    cortados); padrão é $2.5$ se `slot` é `scale.data`;
+    de outro modo, o padrão é $6$.
+
+9.  `slot`: slot de dados para usar, escolher `raw.data` ou
+    "scale.data\`
+
+10. `assay`: *assay* de onde tirar os dados.
+
+11. `label`: rotula as identidades das células acima da barra de cores
+
+12. `size`: tamanho do texto acima da barra de cores.
+
+13. `hjust`: justificação horizontal do texto acima da barra de cores.
+
+14. `vjust`: justificação horizontal do texto acima da barra de cores.
+
+15. `angle`: ãngulo do texto acima da barra de cores.
+
+16. `raster`: se `TRUE`, plote com `geom_raster`, caso contrário, use
+    `geom_tile`. O `geom_raster` pode parecer desfocado em alguns
+    aplicativos de visualização, como o Preview, devido à forma como o
+    raster é interpolado. Defina como `FALSE` se estiver enfrentando
+    esse problema (observe que os gráficos podem levar mais tempo para
+    serem produzidos/renderizados).
+
+17. `draw.lines`:inclua linhas brancas para separar os grupos
+
+18. `lines.width`: número inteiro para ajustar a largura das linhas
+    brancas de separação. Corresponde ao número de "células" entre cada
+    grupo.
+
+19. `group.bar.height`: escala do tamnaho da barra de cores.
+
+20. `combine`: combina plots em um único objeto *ggplot patchworked*. Se
+    "FALSE", retorna uma lista de *ggplots*.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

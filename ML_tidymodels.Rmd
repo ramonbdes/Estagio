@@ -1,0 +1,338 @@
+---
+title: "Machine Learning com tidymodels em RNA-seq"
+author: "Ramon Bertoldi de Souza"
+date: "2025-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+## Criação de um modelo de Machine Learning para categorizar dados de *bulk Rna-seq*
+
+Olá.
+
+Tutorial baseado em
+
+1.  <https://www.ceredalab.com/AI/#Tumor-Normal_Models>; e
+2.  <https://juliasilge.com/blog/ikea-prices/>.
+
+#Preparando os dados
+
+Para construir o modelo, iremos usar o pacote [tidymodels](https://www.tidymodels.org/).
+
+```{r blibliotecas, echo=FALSE, message=FALSE}
+##### Bibliotecas ---------------
+library(tidyverse)
+library(tidymodels)
+library(Rtsne)
+library(vip)
+```
+
+Primeiro vamos carregar os dados. Iremos usar dados de bulk RNA-seq, gerados por Wang *et al*. (Scientific Data, 2018, <https://doi.org/10.1038/sdata.2018.61>), baixados de <https://github.com/mskcc/RNAseqDB>. Selecionamos amostras tumorais de adenocarcinoma de próstata e de pulmão, e tecidos controle.
+
+```{r carregando dados, echo=FALSE}
+# Carregando dados
+normal_A=read.table(
+  '~/workspace/MachineLearning/RNAseqDB-master/data/normalized/prostate-rsem-fpkm-gtex.txt.gz',header = T
+  )#tecido de próstata
+
+normal_B=read.table(
+  '~/workspace/MachineLearning/RNAseqDB-master/data/normalized/lung-rsem-fpkm-gtex.txt.gz',header = T
+  ) #tecido pulmonar
+
+tumor_A=read.table(
+  '~/workspace/MachineLearning/RNAseqDB-master/data/normalized/prad-rsem-fpkm-tcga-t.txt.gz',header = T
+  ) #adenocarcinoma de próstata
+
+tumor_B=read.table(
+  '~/workspace/MachineLearning/RNAseqDB-master/data/normalized/luad-rsem-fpkm-tcga-t.txt.gz',header = T
+  ) #adenocarcinoma pulmonar
+
+tumor_A[1:5, 1:4]
+```
+
+Agora vamos carregar uma lista de oncogenes para filtrármos nas na lista de genes das nossas amostras. A lista veio de Repana *et al*. Genome Biology, 2019 (<https://doi.org/10.1186/s13059-018-1612-0>).
+
+```{r carregando oncogenes}
+##### Carregando a lista de genes de interesse---------------
+cancer_genes = read.delim('~/workspace/MachineLearning/NCG6_tsgoncogene.csv',header = T,sep=',')
+```
+
+Filtrando os genes nas amostras.
+
+```{r filtrando por oncogenes}
+#Fazendo com que apenas os genes de interesse sejam usados no modelo
+
+#Tumor A
+tumor_A=subset(tumor_A,Entrez_Gene_Id%in%cancer_genes$entrez)
+
+rep=names(table(tumor_A$Entrez_Gene_Id)[which(table(tumor_A$Entrez_Gene_Id)>1)])
+
+tumor_A=subset(tumor_A,!Entrez_Gene_Id%in%rep | Hugo_Symbol%in%subset(
+  cancer_genes,entrez%in%rep)$symbol)
+
+rownames(tumor_A)=tumor_A$Entrez_Gene_Id
+
+#Tumor B
+tumor_B=subset(tumor_B,Entrez_Gene_Id%in%cancer_genes$entrez)
+
+rep=names(table(tumor_B$Entrez_Gene_Id)[which(
+  table(tumor_B$Entrez_Gene_Id)>1)])
+
+tumor_B=subset(tumor_B,!Entrez_Gene_Id%in%rep | Hugo_Symbol%in%subset(
+  cancer_genes,entrez%in%rep)$symbol)
+
+rownames(tumor_B)=tumor_B$Entrez_Gene_Id
+
+# Normal A
+normal_A=subset(normal_A,Entrez_Gene_Id%in%cancer_genes$entrez)
+
+rep=names(table(normal_A$Entrez_Gene_Id)[which(
+  table(normal_A$Entrez_Gene_Id)>1)])
+
+normal_A=subset(normal_A,!Entrez_Gene_Id%in%rep | Hugo_Symbol%in%subset(
+  cancer_genes,entrez%in%rep)$symbol)
+
+rownames(normal_A)=normal_A$Entrez_Gene_Id
+
+#Normal B
+normal_B=subset(normal_B,Entrez_Gene_Id%in%cancer_genes$entrez)
+
+rep=names(table(normal_B$Entrez_Gene_Id)[which(
+  table(normal_B$Entrez_Gene_Id)>1)])
+
+normal_B=subset(normal_B,!Entrez_Gene_Id%in%rep | Hugo_Symbol%in%subset(
+  cancer_genes,entrez%in%rep)$symbol)
+
+rownames(normal_B)=normal_B$Entrez_Gene_Id
+
+```
+
+Agora vamos separar os datasets em dados de treino e dados de teste.
+
+```{r treino e teste}
+##### Separar dados de treino e teste--------------- 
+#Tumor A - treino
+tumor_A_train = tumor_A[,c("Hugo_Symbol","Entrez_Gene_Id", 
+                           sample(x = colnames(tumor_A)[3:ncol(tumor_A)], 
+                                  size = round((ncol(tumor_A)-2)*0.75), replace = F))] 
+#Tumor A - teste
+tumor_A_test = cbind(tumor_A[,1:2],tumor_A[,!colnames(tumor_A)%in%colnames(tumor_A_train)]) 
+
+#Tumor B - treino
+tumor_B_train = tumor_B[,c("Hugo_Symbol","Entrez_Gene_Id", 
+                           sample(x = colnames(tumor_B)[3:ncol(tumor_B)], 
+                                  size = round((ncol(tumor_B)-2)*0.75), 
+                                  replace = F))] 
+#Tumor B - teste 
+tumor_B_test = cbind(tumor_B[,1:2],tumor_B[,!colnames(tumor_B)%in%colnames(tumor_B_train)])
+
+#Normal A - treino
+normal_A_train = normal_A[,c("Hugo_Symbol","Entrez_Gene_Id", 
+                             sample(x = colnames(normal_A)[3:ncol(normal_A)], 
+                                    size = round((ncol(normal_A)-2)*0.75), 
+                                    replace = F))] 
+# Normal A - teste
+normal_A_test = cbind(normal_A[,1:2],
+                      normal_A[,!colnames(normal_A)%in%colnames(
+                        normal_A_train)])
+
+#Normal B - treino
+normal_B_train = normal_B[,c("Hugo_Symbol","Entrez_Gene_Id", 
+                             sample(x = colnames(normal_B)[3:ncol(normal_B)],
+                                    size = round((ncol(normal_B)-2)*0.75),
+                                    replace = F))] 
+#Normal B - teste
+normal_B_test = cbind(
+  normal_B[,1:2],
+  normal_B[,!colnames(normal_B)%in%colnames(normal_B_train)])
+```
+
+Juntando tudo:
+
+```{r matriz completa}
+##### Criando matriz completa de treino---------------
+# Tumor : ---
+tumor_A_train=subset(tumor_A_train, Entrez_Gene_Id%in% tumor_B_train$Entrez_Gene_Id)
+
+tumor_B_train=subset(tumor_B_train, Entrez_Gene_Id%in% tumor_A_train$Entrez_Gene_Id)
+
+tumor_train_set = as.data.frame(t(cbind(
+  tumor_A_train[,3:ncol(tumor_A_train)],
+  tumor_B_train[,3:ncol(tumor_B_train)])))
+
+# Normal : ---
+normal_A_train=subset(normal_A_train, Entrez_Gene_Id%in% normal_B_train$Entrez_Gene_Id)
+
+normal_B_train=subset(normal_B_train, Entrez_Gene_Id%in% normal_A_train$Entrez_Gene_Id)
+
+normal_train_set = as.data.frame(t(cbind(
+  normal_A_train[,3:ncol(normal_A_train)],
+  normal_B_train[,3:ncol(normal_B_train)])))
+
+# Combinando: ---
+
+# Verifica se há Ncolunas iguais entre os datasets
+ncol(tumor_train_set) == ncol(normal_train_set) 
+  # Verifica se há N extato de colunas na exata mesma ordem
+sum(colnames(tumor_train_set)==colnames(
+  normal_train_set))/ncol(normal_train_set) 
+
+#Junta os datasets um em cima do outro 
+train_set = rbind(tumor_train_set,normal_train_set) 
+
+#adicionar a letra "g_" nas variáveis para não ter erro de leitura no R
+colnames(train_set)=paste0('g_',colnames(train_set)[1:(ncol(train_set))]) 
+
+#Adiciona a variável "Tumor" ou "Normal" com base no n° de linhas 
+train_set$type=factor(c(rep('Tumor',
+                            nrow(tumor_train_set)),
+                        rep('Normal',
+                            nrow(normal_train_set))),
+                      levels=c('Normal','Tumor'))
+
+##### Criando matriz completa de teste ---------------
+# Tumor : ---
+tumor_A_test=subset(tumor_A_test, Entrez_Gene_Id%in% tumor_B_test$Entrez_Gene_Id)
+
+tumor_B_test=subset(tumor_B_test, Entrez_Gene_Id%in% tumor_A_test$Entrez_Gene_Id)
+
+tumor_test_set = as.data.frame(t(cbind(
+  tumor_A_test[,3:ncol(tumor_A_test)],
+  tumor_B_test[,3:ncol(tumor_B_test)])))
+
+# Normal : ---
+normal_A_test=subset(normal_A_test, Entrez_Gene_Id%in% normal_B_test$Entrez_Gene_Id)
+
+normal_B_test=subset(normal_B_test, Entrez_Gene_Id%in% normal_A_test$Entrez_Gene_Id)
+
+normal_test_set = as.data.frame(t(cbind(
+  normal_A_test[,3:ncol(normal_A_test)],
+  normal_B_test[,3:ncol(normal_B_test)])))
+
+# Combinando: ---
+ncol(tumor_test_set) == ncol(normal_test_set)
+
+sum(colnames(tumor_test_set)==colnames(
+  normal_test_set))/ncol(normal_test_set)
+
+#Junta os datasets um em cima do outro 
+test_set = rbind(tumor_test_set,normal_test_set) 
+
+colnames(test_set)=paste0('g_',colnames(test_set)[1:(ncol(test_set))])
+
+#Adiciona a variável "Tumor" ou "Normal" com base no n° de linhas 
+test_set$type=factor(c(rep('Tumor',nrow(tumor_test_set)),
+                       rep('Normal',nrow(normal_test_set))),
+                     levels=c('Normal','Tumor')) 
+
+```
+
+Pŕe-processamento
+
+```{r pre-processamento}
+tmp <- rbind(train_set, test_set)
+# Divisão treino/teste (mantendo proporção por classe)
+set.seed(900808)
+split <- initial_split(tmp, strata = type)
+train_data <- training(split)
+test_data  <- testing(split)
+```
+
+Visualizando os dados com t-SNE
+
+```{r t-SNE}
+##### t-SNE 
+set.seed(94512)
+tsne <- Rtsne(train_data %>% dplyr::select(-type), dims = 2, perplexity = 15, max_iter = 500)
+tsne_df <- as.data.frame(tsne$Y)
+colnames(tsne_df) <- c("tsne1", "tsne2")
+tsne_df$type <- train_data$type
+
+ggplot(tsne_df, aes(x = tsne1, y = tsne2, color = type)) +
+  geom_point() +
+  theme_bw()
+```
+
+```{r modelo}
+##### Receita de pré-processamento -----
+## 1° transformamos os dados para o modelo funcionar
+# Predizer type com todas as outras variáveis (~.) como preditoreas
+rf_recipe <- recipe(type ~ ., data = train_data) %>% 
+  step_YeoJohnson(all_predictors()) %>% #transformação YeoJohnson 
+  step_center(all_predictors()) %>% #média = 0
+  step_scale(all_predictors()) %>% # /SD
+  step_nzv(all_predictors()) # remove variáveis que não variam
+
+##### Especificação do modelo -----
+rf_spec <- rand_forest(
+  mtry = tune(),  # n° de vars. amostradas aleatoriamente em cada bifurcação
+  min_n = tune(), # n° mín. de dados em nó para o nó se dividir mais.
+  trees = 1000    # n° de árvores criadas
+) %>%
+  set_mode("classification") %>% #objetivo do RF
+  set_engine("ranger", importance = "permutation")
+
+##### Workflow -----
+rf_wf <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_spec)
+
+##### Reamostragem (10-fold CV) -----
+set.seed(900808)
+#validação cruzada 10x, cada fold tendo a mesma proporção de 'type'.
+folds <- vfold_cv(train_data, v = 10, strata = type) 
+
+##### Tuning -----
+set.seed(900808)
+rf_tune <- tune_grid(
+  rf_wf,
+  resamples = folds,
+  grid = 15,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+autoplot(rf_tune)
+
+show_best(rf_tune, metric = "roc_auc")
+```
+
+Usando o melhor modelo
+
+```{r}
+##### Seleciona o melhor modelo -----
+best_params <- select_best(rf_tune, metric = "roc_auc")
+final_rf <- finalize_workflow(rf_wf, best_params)
+
+##### Ajuste final no treino e teste (last_fit) -----
+rf_fit <- last_fit(final_rf, split)
+
+collect_metrics(rf_fit)
+
+##### Matriz de confusão e ROC -----
+preds <- collect_predictions(rf_fit)
+
+conf_mat(preds, truth = type, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+
+roc_curve(preds, truth = type, .pred_Tumor) %>%
+  autoplot()
+```
+
+```{r}
+##### Importância das variáveis -----
+final_model <- rf_fit$.workflow[[1]] %>%
+  extract_fit_parsnip()
+
+vip(final_model, num_features = 20)
+
+##### Avaliação externa (test_data original) -----
+preds_ext <- predict(final_model, new_data = test_data, type = "prob") %>%
+  bind_cols(predict(final_model, new_data = test_data)) %>%
+  bind_cols(test_data %>% select(type))
+
+metrics(preds_ext, truth = type, estimate = .pred_class)
+roc_auc(preds_ext, truth = type, .pred_Tumor)
+```
