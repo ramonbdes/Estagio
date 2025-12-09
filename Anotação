@@ -1,0 +1,272 @@
+#####################
+### Anotação com scCATCH
+########################
+library(Seurat)
+library(scCATCH)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(clustifyR)
+scp.data <- ReadMtx(
+  mtx = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_raw_counts_V1.mtx",
+  features = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_genes_V1.tsv",
+  cells = "~/workspace/CarotidExpression/Carotid_Expression_Matrix_barcodes_V1.tsv")
+scp <- CreateSeuratObject(counts = scp.data, project = "SCP2019_Analysis", 
+                          min.cells = 3, min.features = 200)
+scp <- NormalizeData(scp) 
+scp <- FindVariableFeatures(scp, selection.method = "vst", nfeatures = 2000)
+scp <- ScaleData(scp, features = rownames(scp))
+scp <- RunPCA(scp, features = VariableFeatures(scp))
+scp <- FindNeighbors(scp, dims = 1:50, k.param = 15)
+scp <- FindClusters(scp, resolution = 0.4, algorithm = 4)
+scp <- RunUMAP(scp, dims = 1:50,min.dist = 0.2)
+
+# METADADOS
+df <- read.csv("~/workspace/CarotidExpression/Carotid_MetaData_V1.csv")
+df <- df[-1, ] 
+colnames(df)[1] <- "cell_barcode" 
+rownames(df) <- df$cell_barcode 
+df$cell_barcode <- NULL
+common_cells <- intersect(colnames(scp), rownames(df))
+df <- df[common_cells, ]
+scp <- AddMetaData(object = scp, metadata = df)
+
+
+DimPlot(scp, reduction = "umap", label = TRUE, pt.size = 0.5)
+DimPlot(scp, reduction = "umap", label = TRUE, pt.size = 0.5, group.by = "celltype")
+
+##########################################
+### Anotação com scCATCH
+# Adicionar nomes ao vetor de clusters
+sc_cluster <- as.character(Idents(scp))
+names(sc_cluster) <- Cells(scp)
+sc_data <- GetAssayData(scp, slot = "data")
+# Anotação
+obj <- createscCATCH(data = sc_data, cluster = sc_cluster)
+obj <- findmarkergene(obj, 
+                      species = "Human",
+                      tissue = c("Artery"),  
+                      marker = cellmatch)
+obj <- findcelltype(obj)
+# Adicionar anotações
+annotations <- obj@celltype
+scp$scCATCH_annotation <- annotations$cell_type[match(as.character(Idents(scp)), annotations$cluster)]
+# Resultado final
+print(table(scp$scCATCH_annotation))
+#Visualização
+DimPlot(scp, reduction = "umap", group.by = "scCATCH_annotation", label = TRUE, label.size = 3, repel = TRUE) +
+  ggtitle("Anotação - scCATCH") +  theme(legend.position = "right")
+
+##############################################
+### Anotação com clustifyR
+
+# 1. Processar a nova tabela
+cellmarker_data <- read.csv("/home/rbertoldi/Downloads/SCP2019/BloodVesselCellMarkers.csv")  
+# 2. Limpar e padronizar os dados
+vascular_ref_bloodvessel <- cellmarker_data %>%
+  filter(Species == "Human", 
+         `Tissue.Class` == "Blood vessel",
+         `Cancer` == "Normal cell") %>%
+  select(`Cell.name`, `Cell.marker`) %>%
+  rename(cell_type = `Cell.name`, gene = `Cell.marker`) %>%
+  mutate(
+    # Limpar e padronizar nomes de genes
+    gene = toupper(gsub("a-SMA|a-smooth muscle actin", "ACTA2", gene)),
+    gene = gsub("BCL-6", "BCL6", gene),
+    gene = gsub("C-Kit", "KIT", gene),
+    gene = gsub("CD102", "ICAM2", gene),  # CD102 é ICAM2
+    gene = gsub("CD105", "ENG", gene),    # CD105 é Endoglin
+    gene = gsub("CD133", "PROM1", gene),  # CD133 é Prominin-1
+    gene = gsub("CD15", "FUT4", gene),    # CD15 é FUT4
+    gene = gsub("CD157", "BST1", gene),   # CD157 é BST1
+    gene = gsub("CD16", "FCGR3A", gene),  # CD16 é FCGR3A
+    gene = gsub("Adgre1", "ADGRE1", gene),
+    gene = gsub("Apj", "APLNR", gene),
+    gene = gsub("Bpgm", "BPGM", gene),
+    gene = gsub("C1qb", "C1QB", gene),
+    gene = gsub("Ccl2", "CCL2", gene),
+    gene = gsub("Ccl3", "CCL3", gene),
+    gene = gsub("Ccr7", "CCR7", gene),
+    gene = toupper(gene)  # garantir tudo maiúsculo
+  ) %>%
+  distinct()
+
+# 3. Padronizar tipos celulares
+vascular_ref_clean <- vascular_ref_bloodvessel %>%
+  mutate(
+    cell_type_standardized = case_when(
+      grepl("Smooth muscle|Myofibroblast", cell_type, ignore.case = TRUE) ~ "Smooth_Muscle",
+      grepl("Endothelial|Microvascular", cell_type, ignore.case = TRUE) ~ "Endothelial",
+      grepl("Macrophage|Microglial|Foam cell", cell_type, ignore.case = TRUE) ~ "Macrophage",
+      grepl("Fibroblast", cell_type, ignore.case = TRUE) ~ "Fibroblast",
+      grepl("T cell|Th cell", cell_type, ignore.case = TRUE) ~ "T_cell",
+      grepl("B cell", cell_type, ignore.case = TRUE) ~ "B_cell",
+      grepl("Natural killer", cell_type, ignore.case = TRUE) ~ "NK_cell",
+      grepl("Monocyte", cell_type, ignore.case = TRUE) ~ "Monocyte",
+      grepl("Dendritic", cell_type, ignore.case = TRUE) ~ "Dendritic",
+      grepl("Stem|Progenitor", cell_type, ignore.case = TRUE) ~ "Progenitor",
+      grepl("Astrocyte", cell_type, ignore.case = TRUE) ~ "Astrocyte",
+      grepl("Red blood", cell_type, ignore.case = TRUE) ~ "Erythrocyte",
+      TRUE ~ cell_type
+    )
+  ) %>%
+  filter(!is.na(gene), gene != "") %>%
+  distinct()
+
+# 4. Ver tipos celulares disponíveis
+table(vascular_ref_clean$cell_type_standardized)
+
+# 5. Criar matriz de referência
+all_genes <- unique(vascular_ref_clean$gene)
+all_celltypes <- unique(vascular_ref_clean$cell_type_standardized)
+
+bloodvessel_ref <- matrix(0, nrow = length(all_genes), ncol = length(all_celltypes))
+rownames(bloodvessel_ref) <- all_genes
+colnames(bloodvessel_ref) <- all_celltypes
+
+for(i in 1:nrow(vascular_ref_clean)) {
+  gene <- vascular_ref_clean$gene[i]
+  celltype <- vascular_ref_clean$cell_type_standardized[i]
+  if(gene %in% rownames(bloodvessel_ref) && celltype %in% colnames(bloodvessel_ref)) {
+    bloodvessel_ref[gene, celltype] <- 1
+  }
+}
+
+# 6. Verificar a matriz
+print("Dimensões da nova matriz:")
+dim(bloodvessel_ref)
+
+print("Marcadores por tipo celular:")
+colSums(bloodvessel_ref)
+
+# 7. Fazer a anotação
+scp <- clustify(
+  input = scp,
+  cluster_col = "seurat_clusters",
+  ref_mat = bloodvessel_ref,
+  seurat_out = TRUE
+)
+# 8. Ver resultados
+table(scp$type)
+
+
+# A. UMAP com novas anotações
+p1 <- DimPlot(scp, reduction = "umap", group.by = "type", 
+              label = TRUE, label.size = 3, repel = TRUE) +
+  ggtitle("Anotações - Vasos Sanguíneos") +
+  theme(legend.position = "right")
+# B. Comparação com clusters originais
+p2 <- DimPlot(scp, reduction = "umap", group.by = "seurat_clusters",
+              label = TRUE, repel = TRUE) +
+  ggtitle("Clusters Originais")
+p1 + p2
+# C. Visualizar marcadores específicos
+FeaturePlot(scp, features = c("ACTA2", "ENG", "CD68", "CD3D"), 
+            ncol = 2, max.cutoff = 3)
+# D. Violin plots
+VlnPlot(scp, features = c("ACTA2", "PECAM1", "CD68", "CD3D"), 
+        group.by = "type", pt.size = 0.1)
+
+
+
+
+######## REMOÇÃO DA ANTIGA ANOTAÇÃO
+# Remover a coluna de anotação anterior dos metadados
+scp@meta.data$type <- NULL
+# Verificar que foi removida
+print("Colunas após remover 'type':")
+colnames(scp@meta.data)
+# Agora refazer a anotação com a nova matriz
+scp <- clustify(
+  input = scp,
+  cluster_col = "seurat_clusters",
+  ref_mat = bloodvessel_ref,
+  seurat_out = TRUE
+)
+# Verificar resultados
+print("Nova anotação:")
+table(scp$type)
+
+###########################
+# Carregue os pacotes necessários
+# Carregar pacotes
+library(Seurat)
+library(SingleR)
+library(celldex)
+library(dplyr) # Para pipes e manipulação de dados, se necessário
+
+# --- Configuração de Caminhos ---
+processed_scp_path <- "/home/rbertoldi/Downloads/SCP2019/scp_processed_final.rds"
+output_path_final <- "/home/rbertoldi/Downloads/SCP2019/scp_processed_final_with_singleR.rds"
+
+# --- 1. Carregar Objeto Seurat ---
+scp <- readRDS(processed_scp_path)
+
+# --- 2. Preparar Clusters para Anotação ---
+# Converte seurat_clusters para factor com níveis ordenados (crucial para AggregateExpression)
+scp$seurat_clusters <- factor(scp$seurat_clusters, levels = unique(as.character(scp$seurat_clusters)))
+
+# --- 3. Preparar Dados de Referência SingleR ---
+hpca.se <- HumanPrimaryCellAtlasData() # Human Primary Cell Atlas Data
+
+# --- 4. Calcular Expressão Média por Cluster (Pseudo-bulk) ---
+# Usa AggregateExpression para gerar a matriz de Genes x Clusters
+cluster_means <- AggregateExpression(
+  object = scp,
+  group.by = "seurat_clusters",
+  assays = "RNA",
+  slot = "data"
+)$RNA
+
+# --- 5. Harmonizar Nomes de Coluna (Crucial) ---
+# Garante que os nomes das colunas de cluster_means correspondem aos IDs reais de scp$seurat_clusters
+if (length(colnames(cluster_means)) == length(levels(scp$seurat_clusters))) {
+  colnames(cluster_means) <- levels(scp$seurat_clusters)
+} else {
+  stop("Erro: Mismatch no número de colunas do cluster_means e níveis de clusters Seurat.")
+}
+
+# --- 6. Executar Anotação SingleR ---
+singleR_predictions_clusters <- SingleR(
+  test = cluster_means,
+  ref = hpca.se,
+  labels = hpca.se$label.main # ou hpca.se$label.fine para mais granularidade
+)
+
+# --- 7. Mapear Anotações para o Objeto Seurat ---
+# Extrai os rótulos e IDs harmonizados
+singleR_labels <- singleR_predictions_clusters$pruned.labels
+cluster_IDs_harmonized <- colnames(cluster_means)
+
+# Cria o mapa nomeado de cluster ID -> label
+annotations_map <- singleR_labels
+names(annotations_map) <- cluster_IDs_harmonized
+
+# Cria o vetor de anotação para cada célula e nomeia com os barcodes das células
+cell_annotations_vector <- annotations_map[as.character(scp$seurat_clusters)]
+names(cell_annotations_vector) <- colnames(scp) # CRUCIAL para AddMetaData
+
+# Adiciona a nova coluna de metadados ao objeto Seurat
+scp <- AddMetaData(
+  object = scp,
+  metadata = cell_annotations_vector,
+  col.name = "singleR_annotations"
+)
+
+# --- 8. Visualização Rápida (Opcional) ---
+# DimPlot(scp, group.by = "singleR_annotations", label = TRUE, repel = TRUE) + NoLegend() + ggtitle("SingleR Annotations")
+
+# --- 9. Salvar Objeto Seurat Final ---
+saveRDS(scp, file = output_path_final)
+message(paste("Objeto Seurat final com anotações SingleR salvo em:", output_path_final))
+
+# --- 10. Tabela de Anotação de Cluster (Opcional) ---
+# Cria um dataframe simples para ver as anotações por cluster
+singleR_cluster_table <- data.frame(
+  cluster_ID = cluster_IDs_harmonized,
+  singleR_Label = singleR_labels
+)
+print("Tabela de Anotação de Cluster (SingleR):")
+print(singleR_cluster_table)
