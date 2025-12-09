@@ -1,0 +1,38 @@
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+library(tidyr)
+library(data.table)
+library(R.utils)
+
+# METADADOS-----------------------------------------------
+df <- read.csv("~/workspace/CarotidExpression/Carotid_MetaData_V1.csv")
+df <- df[-1, ] 
+colnames(df)[1] <- "cell_barcode" 
+rownames(df) <- df$cell_barcode 
+df$cell_barcode <- NULL
+common_cells <- intersect(colnames(obj), rownames(df))
+df <- df[common_cells, ]
+obj <- AddMetaData(object = obj, metadata = df)
+
+#---------------------------------------------------------
+obj.data <- ReadMtx(
+  mtx = "GSM5511025_16/GSM5511025_16_matrix.mtx",
+  features = "GSM5511025_16/GSM5511025_16_features.tsv",
+  cells = "GSM5511025_16/GSM5511025_16_barcodes.tsv")
+obj <- CreateSeuratObject(counts = obj.data, project = "obj", min.cells = 3, min.features = 200)
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+obj <- NormalizeData(obj, normalization.method = "LogNormalize", scale.factor = 10000)
+obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 2000)
+obj <- ScaleData(obj, features = rownames(obj))
+obj <- CellCycleScoring(obj, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+obj <- ScaleData(obj, vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), features = rownames(obj))
+obj <- RunPCA(obj, features = VariableFeatures(object = obj))
+obj <- FindNeighbors(obj, dims = 1:20, k.param = 20)
+obj <- FindClusters(obj, resolution = 0.2, algorithm = 4)
+obj <- RunUMAP(obj, dims = 1:20, min.dist = 0.2)
+DimPlot(obj, reduction = "umap")
+saveRDS(obj, file = "~/workspace/obj.rds")
