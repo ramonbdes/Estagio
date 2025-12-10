@@ -7,7 +7,7 @@ library(data.table)
 library(R.utils)
 
 # METADADOS-----------------------------------------------
-df <- read.csv("~/workspace/CarotidExpression/Carotid_MetaData_V1.csv")
+df <- read.csv("~/workspace/MetaData.csv")
 df <- df[-1, ] 
 colnames(df)[1] <- "cell_barcode" 
 rownames(df) <- df$cell_barcode 
@@ -18,9 +18,9 @@ obj <- AddMetaData(object = obj, metadata = df)
 
 #---------------------------------------------------------
 obj.data <- ReadMtx(
-  mtx = "GSM5511025_16/GSM5511025_16_matrix.mtx",
-  features = "GSM5511025_16/GSM5511025_16_features.tsv",
-  cells = "GSM5511025_16/GSM5511025_16_barcodes.tsv")
+  mtx = "path_to_dir/file.mtx",
+  features = "path_to_dir/file.tsv",
+  cells = "path_to_dir/file.tsv")
 obj <- CreateSeuratObject(counts = obj.data, project = "obj", min.cells = 3, min.features = 200)
 obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
 s.genes <- cc.genes$s.genes
@@ -32,7 +32,7 @@ obj <- CellCycleScoring(obj, s.features = s.genes, g2m.features = g2m.genes, set
 obj <- ScaleData(obj, vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), features = rownames(obj))
 obj <- RunPCA(obj, features = VariableFeatures(object = obj))
 obj <- FindNeighbors(obj, dims = 1:20, k.param = 20)
-obj <- FindClusters(obj, resolution = 0.2, algorithm = 4)
+obj <- FindClusters(obj, resolution = 0.9, algorithm = 4)
 obj <- RunUMAP(obj, dims = 1:20, min.dist = 0.2)
 DimPlot(obj, reduction = "umap")
 saveRDS(obj, file = "~/workspace/obj.rds")
